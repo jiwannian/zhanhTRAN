@@ -1,0 +1,15 @@
+{
+  "name": "zhanhtran",
+  "version": "1.0.1",
+  "private": true,
+  "description": "Custom-provider document translation for Zotero",
+  "license": "AGPL-3.0-only",
+  "repository": "github:jiwannian/zhanhTRAN",
+  "engines": {"node": ">=22"},
+  "scripts": {
+    "test": "node --test --experimental-test-coverage --test-coverage-lines=80 --test-coverage-branches=80 tests/*.test.cjs",
+    "test:runtime": "node --test tests/public-runtime.test.cjs",
+    "build": "python tools/package.py"
+  },
+  "devDependencies": {"playwright": "1.64.0"}
+}

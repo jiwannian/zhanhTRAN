@@ -1,0 +1,15 @@
+{
+  "manifest_version": 2,
+  "name": "zhanhTRAN",
+  "version": "1.0.1",
+  "description": "Custom-provider translation with local parsing and source-layout file output",
+  "author": "zhanh",
+  "homepage_url": "https://github.com/jiwannian/zhanhTRAN",
+  "icons": {"48": "icons/icon-48.png", "96": "icons/icon-96.png"},
+  "applications": {"zotero": {
+    "id": "zhanhtran@zhanh.local",
+    "strict_min_version": "9.0",
+    "strict_max_version": "10.*",
+    "update_url": "https://zhanhtran.invalid/update.json"
+  }}
+}

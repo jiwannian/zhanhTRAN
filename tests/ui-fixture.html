@@ -1,0 +1,48 @@
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ZhanhTRAN custom provider QA fixture</title>
+<style>html{color-scheme:light dark}body{margin:0;background:Canvas;color:CanvasText}</style>
+<script src="../src/vendor/eventsource-parser.js"></script><script src="../src/provider-response.js"></script>
+<script src="../src/output-settings.js"></script><script src="../src/custom-provider-core.js"></script><script src="../src/translation-progress.js"></script><script src="../src/custom-provider-zotero.js"></script></head>
+<body><div id="menu_ToolsPopup"></div><div id="zotero-itemmenu"></div><div id="zhanhtran-custom-provider-root"></div>
+<script>
+const fixture={prefs:{},logins:[],notes:[],pdfs:[],alerts:[],calls:[],parses:[],exports:[],imports:{},confirmations:[],confirm:true};
+const services={logins:{
+ findLogins:(origin,form,realm)=>fixture.logins.filter(x=>x.hostname===origin&&x.httpRealm===realm),
+ addLoginAsync:async x=>fixture.logins.push(x),
+ modifyLogin:(old,x)=>fixture.logins.splice(fixture.logins.indexOf(old),1,x),
+ removeLogin:x=>fixture.logins.splice(fixture.logins.indexOf(x),1)},
+ prompt:{alert:(win,title,text)=>fixture.alerts.push(text),confirm:(win,title,text)=>{fixture.confirmations.push({title,text});return fixture.confirm;}}};
+const noteSource={isNote:()=>true,getNote:()=>'<p>Hello, world.</p>',getNoteTitle:()=> 'Fixture note',parentID:7,libraryID:1};
+fixture.items=[noteSource];
+window.ZoteroPane={getSelectedItems:()=>fixture.items};
+fixture.messages=[];
+window.openDialog=(url,name,features,args)=>{
+ const dialog=new EventTarget();dialog.closed=false;dialog.features=features;
+ dialog.document=document.implementation.createHTMLDocument('Translation progress');
+ for(const [id,tag] of [['translation-status','p'],['translation-progress','progress'],['translation-percent','span'],['translation-action','button']]){
+  const node=dialog.document.createElement(tag);node.id=id;dialog.document.body.appendChild(node);
+ }
+ dialog.close=()=>{dialog.closed=true;dialog.dispatchEvent(new Event('unload'));};
+ fixture.messages.push(dialog);queueMicrotask(()=>args.progress.bind(dialog));return dialog;
+};
+document.createXULElement=tag=>document.createElement(tag);
+const Zotero={Prefs:{get:key=>fixture.prefs[key],set:(key,x)=>fixture.prefs[key]=x},
+ Libraries:{userLibraryID:1},
+ logError:e=>fixture.alerts.push(e.message),DB:{executeTransaction:async fn=>{if(fixture.transaction)throw new Error('Nested Zotero transaction');fixture.transaction=true;try{return await fn();}finally{fixture.transaction=false;}}},
+ Items:{get:id=>fixture.byID?.[id]},
+ Item:class {constructor(type){this.type=type;}setNote(text){this.note=text;}getNote(){return this.note;}async save(){if(!this.id){fixture.notes.push(this);this.id=fixture.notes.length;}return this.id;}async saveTx(){return Zotero.DB.executeTransaction(()=>this.save());}},
+ Attachments:{linkFromFile:async(options)=>{const item={...options,id:100+fixture.pdfs.length,setField(name,value){this[name]=value;},saveTx:async()=>{}};fixture.pdfs.push(item);return item;},importEmbeddedImage:async({blob})=>Zotero.DB.executeTransaction(async()=>{if(!(blob instanceof Blob))throw new Error('Blob missing');fixture.embedded=(fixture.embedded||0)+1;return {key:'IMAGE'+fixture.embedded};})},
+ ProgressWindow:class{ItemProgress=class{setText(){}setProgress(){}};changeHeadline(){}show(){}startCloseTimer(){}}};
+const api=ZhanhTRANCustom.install({Zotero,Services:services,core:ZhanhTRANCustomCore,Blob,iconURL:'../icons/icon-48.png',createProgress:ZhanhTRANTranslationProgress.create,
+ IOUtils:{exists:async p=>p in fixture.imports,readUTF8:async p=>fixture.imports[p],remove:async p=>delete fixture.imports[p],read:async()=>new Uint8Array([1,2,3])},
+ PathUtils:{profileDir:'/fixture-profile',join:(...parts)=>parts.join('/')},
+ createLogin:(hostname,formSubmitURL,httpRealm,username,password)=>({hostname,formSubmitURL,httpRealm,username,password}),
+ bridge:{assetPath:async()=>'/figure.png',parseDocument:async(path)=>{fixture.parses.push(path);return {schema:1,pages:[{number:1,blocks:[{id:'p1-b1',type:'paragraph',text:'Hello, world.'},{id:'p1-b2',type:'table',rows:[['Model','Score'],['Alpha','95']]}]}],assets:[],warnings:[]};},
+ saveResult:async(doc,result)=>fixture.exports.push(result.document),
+ exportFile:async()=>{const ext=fixture.parses.at(-1).split('.').pop();return {translated:'/translated.'+ext,bilingual:'/bilingual.'+ext};},
+ renderMarkdown:async md=>'<p>'+md.replace(/[<>]/g,'')+'</p><script>alert(1)</scr'+'ipt><img alt="p1-image" src="https://untrusted.example/pixel" onerror="bad()"><a href="javascript:bad()">bad</a>'},
+ fetch:async(url,options)=>{const body=JSON.parse(options.body);fixture.calls.push({url,headers:options.headers,body});const content=body.messages.at(-1).content;
+ if(fixture.hold)await new Promise(resolve=>fixture.release=resolve);
+ let translation='你好，世界。';if(content.startsWith('['))translation=JSON.stringify(JSON.parse(content).map(x=>({...x,text:'译文 '+x.text})));
+ return {ok:true,status:200,json:async()=>url.endsWith('/messages')?{content:[{type:'text',text:translation}],stop_reason:'end_turn'}:{choices:[{message:{content:translation},finish_reason:'stop'}]}};}});
+window.fixture=fixture;window.api=api;api.mount(window);api.registerWindow(window);
+</script></body></html>

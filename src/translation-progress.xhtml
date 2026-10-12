@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <head>
+    <title>zhanhTRAN</title>
+    <style>
+      :root { color-scheme: light dark; font: 14px system-ui, sans-serif; background: Canvas; color: CanvasText; }
+      body { margin: 0; padding: 20px; box-sizing: border-box; min-width: 260px; }
+      #translation-status { margin: 0 0 18px; min-height: 42px; overflow-wrap: anywhere; }
+      .meter { display: flex; align-items: center; gap: 12px; }
+      progress { width: 100%; min-width: 0; height: 14px; }
+      #translation-percent { width: 44px; flex-shrink: 0; text-align: right; }
+      footer { display: flex; justify-content: flex-end; margin-top: 20px; }
+      button { min-width: 80px; padding: 6px 12px; font: inherit; }
+    </style>
+  </head>
+  <body>
+    <p id="translation-status" role="status" aria-live="polite">本地解析 / OCR / 表格识别…</p>
+    <div class="meter"><progress id="translation-progress" max="100" aria-label="翻译进度"></progress><span id="translation-percent"></span></div>
+    <footer><button id="translation-action" type="button">取消</button></footer>
+    <script><![CDATA[
+      window.addEventListener('DOMContentLoaded',()=>window.arguments[0].progress.bind(window),{once:true});
+    ]]></script>
+  </body>
+</html>

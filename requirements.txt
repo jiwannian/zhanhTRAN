@@ -1,0 +1,7 @@
+PyMuPDF==1.28.2
+Pillow==12.3.0
+numpy==2.2.6
+rapidocr-onnxruntime==1.4.4
+onnxruntime==1.23.2
+img2table==2.0.0
+opencv-contrib-python==4.11.0.86
