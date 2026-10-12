@@ -3,14 +3,15 @@ const assert=require('node:assert/strict');
 const fs=require('node:fs/promises');
 const os=require('node:os');
 const path=require('node:path');
-const {spawn}=require('node:child_process');
+const {spawn,execFileSync}=require('node:child_process');
 const {Readable}=require('node:stream');
 const B=require('../src/local-parser-zotero.js');
 function pipe(stream){const iterator=stream[Symbol.asyncIterator]();return {async readString(){const n=await iterator.next();return n.done?'':n.value.toString();}};}
+function pythonPath(){return process.env.ZHANHTRAN_PYTHON || execFileSync('python',['-c','import sys;print(sys.executable)'],{encoding:'utf8'}).trim();}
 test('one-shot native process bridge: paths with spaces, saved structure and no login or key',async()=>{
  const folder=await fs.mkdtemp(path.join(os.tmpdir(),'zhanhtran bridge '));
  const source=path.join(folder,'fixture image.png');
- const python=process.env.ZHANHTRAN_PYTHON || 'python';
+ const python=pythonPath();
  const script=path.resolve(__dirname,'../src/local_parser.py');
  const make=spawn(python,['-c',"from PIL import Image,ImageDraw;import sys;i=Image.new('RGB',(500,140),'white');ImageDraw.Draw(i).text((20,30),'Hello, world.',fill='black',font_size=42);i.save(sys.argv[1])",source]);
  assert.equal(await new Promise(r=>make.on('exit',r)),0);
@@ -49,7 +50,7 @@ test('one-shot native process bridge: paths with spaces, saved structure and no 
 test('real one-shot PDF export creates two native files and refuses to delete previous outputs',async()=>{
  const folder=await fs.mkdtemp(path.join(os.tmpdir(),'zhanhtran pdf bridge '));
  const source=path.join(folder,'fixture source.pdf');
- const python=process.env.ZHANHTRAN_PYTHON || 'python';
+ const python=pythonPath();
  const make=spawn(python,['-c',"import pymupdf,sys;d=pymupdf.open();p=d.new_page();p.insert_text((40,60),'Hello world. Native PDF layout translation fixture.',fontsize=12);d.save(sys.argv[1])",source]);
  assert.equal(await new Promise(r=>make.on('exit',r)),0);
  const calls=[];

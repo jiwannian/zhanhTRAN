@@ -55,7 +55,7 @@ python -m coverage report --fail-under=80
 python tools/package.py
 ```
 
-JS/Python 桥接测试使用 `ZHANHTRAN_PYTHON` 指定已安装依赖的 Python，默认 `python`。OCR 测试需要 CJK 字体：Windows 默认查找微软雅黑，Linux 查找文泉驿正黑；也可设置 `ZHANHTRAN_TEST_FONT`。Ubuntu 可安装 `fonts-wqy-zenhei`。`ZHANHTRAN_CHROME` 可指定用于 UI 测试的 Chromium/Chrome，否则使用 Playwright Chromium。
+JS/Python 桥接测试使用 `ZHANHTRAN_PYTHON` 指定已安装依赖的 Python 绝对路径；未设置时，从 PATH 中的 `python` 读取 `sys.executable` 获取绝对路径。OCR 测试需要 CJK 字体：Windows 默认查找微软雅黑，Linux 查找文泉驿正黑；也可设置 `ZHANHTRAN_TEST_FONT`。Ubuntu 可安装 `fonts-wqy-zenhei`。`ZHANHTRAN_CHROME` 可指定用于 UI 测试的 Chromium/Chrome，否则使用 Playwright Chromium。
 
 测试只使用合成输入及模拟供应商。单元/集成和浏览器测试不是真实供应商翻译质量或 Zotero 原生端到端测试的替代品。构建结果为 `dist/zhanhTRAN-1.0.1.xpi`，相同源码与 Python 压缩运行环境可重现相同包字节。
 
