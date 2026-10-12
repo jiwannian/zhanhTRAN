@@ -11,6 +11,8 @@ import sys
 
 import pymupdf as fitz
 
+# CLI stdout is a single JSON response, not a dependency diagnostic channel.
+fitz.no_recommend_layout()
 
 def checked_rect(value, bounds):
     if not isinstance(value, (list, tuple)) or len(value) != 4 or not all(

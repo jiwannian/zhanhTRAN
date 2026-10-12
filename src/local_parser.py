@@ -12,6 +12,8 @@ import numpy as np
 import pymupdf as fitz
 from PIL import Image
 
+# CLI stdout is a single JSON response, not a dependency diagnostic channel.
+fitz.no_recommend_layout()
 Image.MAX_IMAGE_PIXELS = 25_000_000
 _OCR = None
 

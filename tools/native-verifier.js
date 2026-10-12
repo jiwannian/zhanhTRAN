@@ -69,6 +69,9 @@ async function verify(){
   const api=Zotero.zhanhTRAN;check(api,'independent entry missing');
   for(let n=0;n<120&&!Zotero.getMainWindow();n++)await pause(250);
   win=Zotero.getMainWindow();check(win,'main window missing');
+  for(let n=0;n<120&&(!win.ZoteroPane?.itemsView||!win.ZoteroPane?.collectionsView?.itemTreeView);n++)await pause(250);
+  check(win.ZoteroPane?.itemsView&&win.ZoteroPane?.collectionsView?.itemTreeView,'main library trees not ready');
+  await win.ZoteroPane.itemsView.waitForLoad();
   const addon=await AddonManager.getAddonByID('zhanhtran@zhanh.local');
   report.configuration={model:api.selected().model,output:api.outputSettings(),keyReadback:(await api.keyFor(provider))==='qa-fixture-only'};
   check(report.configuration.keyReadback&&report.configuration.output.order==='original-left','independent configuration failed');
