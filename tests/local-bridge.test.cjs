@@ -6,7 +6,7 @@ const path=require('node:path');
 const {spawn,execFileSync}=require('node:child_process');
 const {Readable}=require('node:stream');
 const B=require('../src/local-parser-zotero.js');
-function pipe(stream){const iterator=stream[Symbol.asyncIterator]();return {async readString(){const n=await iterator.next();return n.done?'':n.value.toString();}};}
+function pipe(stream){const iterator=stream[Symbol.asyncIterator]();return {async readString(){const n=await iterator.next();const text=n.done?'':n.value.toString();if(process.env.ZHANHTRAN_QA_DEBUG&&text)console.error(text);return text;}};}
 function pythonPath(){return process.env.ZHANHTRAN_PYTHON || execFileSync('python',['-c','import sys;print(sys.executable)'],{encoding:'utf8'}).trim();}
 test('one-shot native process bridge: paths with spaces, saved structure and no login or key',async()=>{
  const folder=await fs.mkdtemp(path.join(os.tmpdir(),'zhanhtran bridge '));
