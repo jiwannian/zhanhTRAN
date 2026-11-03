@@ -6,7 +6,8 @@ const path=require('node:path');
 const root=path.join(__dirname,'..');
 test('independent startup never loads the original bundle or preferences',()=>{
  const manifest=JSON.parse(fs.readFileSync(path.join(root,'manifest.json')));
- assert.equal(manifest.name,'zhanhTRAN');assert.equal(manifest.version,'1.0.1');
+ const packageVersion=JSON.parse(fs.readFileSync(path.join(root,'package.json'))).version;
+ assert.equal(manifest.name,'zhanhTRAN');assert.equal(manifest.version,packageVersion);
  assert.equal(manifest.applications.zotero.id,'zhanhtran@zhanh.local');
  assert.equal(manifest.applications.zotero.update_url,'https://zhanhtran.invalid/update.json');
  const bootstrap=fs.readFileSync(path.join(root,'bootstrap.js'),'utf8');
