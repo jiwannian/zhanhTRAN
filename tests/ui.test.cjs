@@ -9,6 +9,14 @@ test('settings presentation: grouped fields, responsive geometry, dark mode and 
  try{
   const page=await browser.newPage({viewport:{width:1000,height:900}});
   await page.goto(pathToFileURL(path.join(__dirname,'ui-fixture.html')).href);
+  const concurrency=page.getByRole('spinbutton',{name:'并发翻译请求数',exact:true});
+  assert.equal(await concurrency.inputValue(),'2');
+  await concurrency.fill('10');await concurrency.blur();
+  assert.equal(await page.evaluate(()=>api.translationConcurrency()),10);
+  await concurrency.fill('11');await concurrency.blur();
+  assert.equal(await concurrency.inputValue(),'10');
+  assert.equal(await page.evaluate(()=>api.translationConcurrency()),10);
+  await concurrency.fill('2');await concurrency.blur();
   await page.getByRole('heading',{name:'zhanhTRAN',exact:true}).waitFor();
   assert.equal(await page.locator('.zt-provider-grid').count(),1,'provider fields need a distinct responsive group');
   assert.equal(await page.getByRole('group',{name:'排版输出',exact:true}).count(),1);

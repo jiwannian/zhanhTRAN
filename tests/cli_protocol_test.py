@@ -1,5 +1,6 @@
 """Fresh CLI processes must return JSON even without optional layout packages."""
 import hashlib
+import copy
 import importlib.util
 import json
 import os
@@ -40,8 +41,10 @@ class CLIProtocolTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def run_cli(self, script, source, document=None):
+    def run_cli(self, script, source, document=None, progress=False):
         args = [str(ROOT / 'src' / script), '--input', str(source), '--output', str(self.root / script)]
+        if progress:
+            args.append('--progress')
         if document is not None:
             file = self.root / (script + '.json')
             file.write_text(json.dumps(document), encoding='utf-8')
@@ -53,11 +56,24 @@ class CLIProtocolTests(unittest.TestCase):
         value = json.loads(result.stdout)
         self.assertTrue(value['ok'])
         self.assertEqual(len(result.stdout.strip().splitlines()), 1)
-        self.assertEqual(result.stderr, '')
+        if progress:
+            events = [json.loads(line.removeprefix('ZHANHTRAN_PROGRESS ')) for line in result.stderr.splitlines()
+                      if line.startswith('ZHANHTRAN_PROGRESS ')]
+            self.assertTrue(events)
+            self.assertEqual(events[-1]['done'], events[-1]['total'])
+            self.assertEqual(len(events), len(result.stderr.splitlines()))
+        else:
+            self.assertEqual(result.stderr, '')
         return value
 
     def test_parser_stdout_is_one_json_object(self):
         self.run_cli('local_parser.py', self.source)
+
+    def test_progress_uses_stderr_without_changing_stdout_contract(self):
+        self.run_cli('local_parser.py', self.source, progress=True)
+        document = parser.parse_document(self.source, self.root / 'parsed')
+        document['translated_pages'] = document['pages']
+        self.run_cli('local_pdf.py', self.source, document, progress=True)
 
     def test_pdf_export_stdout_is_one_json_object(self):
         document = parser.parse_document(self.source, self.root / 'parsed')
@@ -65,6 +81,22 @@ class CLIProtocolTests(unittest.TestCase):
         result = self.run_cli('local_pdf.py', self.source, document)
         self.assertTrue(Path(result['translated']).is_file())
         self.assertTrue(Path(result['bilingual']).is_file())
+
+    def test_tight_ocr_label_exports_at_original_size_in_fresh_process(self):
+        spec = importlib.util.spec_from_file_location('cli_ocr_fixture', ROOT/'tests/ocr_layout_test.py')
+        fixture = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fixture)
+        source = self.root/'tight-label.pdf'
+        document = fixture.fixture(source, text='合成地图标签', narrow=True, label_box=fixture.OCR8_BOX)
+        result = self.run_cli('local_pdf.py', source, document, progress=True)
+        report = json.loads((self.root/'local_pdf.py/pdf-layout-report.json').read_text('utf-8'))
+        placed = report['placements'][0]
+        self.assertEqual(placed['fit'], 'fixed-region')
+        self.assertEqual(placed['bbox'], fixture.OCR8_BOX)
+        self.assertGreater(placed['scale'],0)
+        self.assertLessEqual(placed['scale'],1)
+        with fitz.open(result['translated']) as pdf:
+            self.assertIn('合成地图标签', ''.join(pdf[0].get_text().split()))
 
     def test_image_export_stdout_is_one_json_object(self):
         source = self.root / 'source.png'
@@ -79,6 +111,25 @@ class CLIProtocolTests(unittest.TestCase):
         result = self.run_cli('local_image.py', source, document)
         self.assertTrue(Path(result['translated']).is_file())
         self.assertTrue(Path(result['bilingual']).is_file())
+
+    def test_layout_failure_returns_safe_region_in_one_json_object(self):
+        document = parser.parse_document(self.source,self.root/'parsed')
+        block = document['pages'][0]['blocks'][0]
+        block['layout_runs'] = [{'text':'Synthetic','bbox':[30,48,31,49]}]
+        block['style']['size']=float('nan')
+        document['translated_pages'] = copy.deepcopy(document['pages'])
+        document['translated_pages'][0]['blocks'][0]['layout_runs'][0]['text'] = '完整译文'*20
+        path = self.root/'translated.json'
+        path.write_text(json.dumps(document),encoding='utf8')
+        proc = subprocess.run([sys.executable,'-I',str(ROOT/'src/local_pdf.py'),'--input',str(self.source),
+                               '--document',str(path),'--output',str(self.root/'failed')],capture_output=True,text=True,encoding='utf8',timeout=60)
+        self.assertEqual(proc.returncode,2)
+        self.assertEqual(len(proc.stdout.strip().splitlines()),1)
+        self.assertEqual(proc.stderr,'')
+        result = json.loads(proc.stdout)
+        self.assertEqual(result['error'],'PDF_LAYOUT_INVALID')
+        self.assertEqual(result['failed_page'],1)
+        self.assertEqual(result['region'],block['id']+'-run0')
 
 
 if __name__ == '__main__':

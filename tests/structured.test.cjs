@@ -13,6 +13,63 @@ const respond=async(url,options)=>{
  const map={'Research':'研究','Hello, world.':'你好，世界。','Model':'模型','Score':'分数','Alpha':'阿尔法','Accuracy':'准确率'};
  return {ok:true,json:async()=>({choices:[{finish_reason:'stop',message:{content:JSON.stringify(units.map(x=>({...x,text:map[x.text]||x.text})))}}]})};
 };
+
+test('definition rows translate only their own value and retain native keys when responses arrive reversed',async()=>{
+ const labels=['TAWS','TCSN','TSIB','TTSN','VNPR','VFR'];
+ const doc={schema:1,pages:[{number:1,blocks:labels.map((label,i)=>({id:'d'+i,type:'paragraph',
+  text:label+'\nSynthetic value '+i,translation_text:'Synthetic value '+i,
+  prefix:{text:label,kind:'definition',bbox:[72,100+i*20,100,114+i*20]},
+  definition:{label,label_bbox:[72,100+i*20,100,114+i*20],body_bbox:[144,100+i*20,400,114+i*20]},
+  flow_blocked:true}))}]};
+ const snapshot=JSON.stringify(doc);
+ const result=await C.translateDocument(C.DEFAULT,'fixture-key',doc,{fetch:async(_url,options)=>{
+  const units=unitsFrom(options);assert.deepEqual(units.map(x=>x.text),labels.map((_,i)=>'Synthetic value '+i));
+  assert.ok(units.every(x=>labels.every(label=>!x.text.includes(label))));
+  return envelope(units.toReversed().map(x=>({...x,text:'独立释义'+x.id.slice(1)})));
+ }});
+ assert.equal(JSON.stringify(doc),snapshot);
+ result.document.translated_pages[0].blocks.forEach((b,i)=>{
+  assert.equal(b.translation_text,'独立释义'+i);assert.equal(b.definition.label,labels[i]);
+  assert.deepEqual(b.prefix,doc.pages[0].blocks[i].prefix);
+  assert.deepEqual(b.definition,doc.pages[0].blocks[i].definition);
+ });
+ assert.equal(result.document.translated_pages[0].blocks[3].definition.label,'TTSN');
+});
+
+test('an omitted definition row is retried by its own ID, not joined to a successful preceding row',async()=>{
+ const doc={schema:1,pages:[{number:1,blocks:['TSIB','TTSN'].map((label,i)=>({id:'d'+i,type:'paragraph',
+  text:label+'\nSynthetic definition '+i,translation_text:'Synthetic definition '+i,definition:{label}}))}]};
+ const calls=[];
+ const result=await C.translateDocument(C.DEFAULT,'fixture-key',doc,{retryAttempts:5,retryDelayMs:1,fetch:async(_url,options)=>{
+  const units=unitsFrom(options);calls.push(units.map(x=>x.id));
+  return envelope((calls.length===1?units.slice(0,1):units).map(x=>({...x,text:'释义'+x.id.slice(1)})));
+ }});
+ assert.deepEqual(calls,[['u0','u1'],['u1']]);
+ assert.deepEqual(result.document.translated_pages[0].blocks.map(b=>b.translation_text),['释义0','释义1']);
+ assert.deepEqual(result.document.translated_pages[0].blocks.map(b=>b.definition.label),['TSIB','TTSN']);
+});
+
+test('spaced dotted mixed-case and unit keys stay native and a missing Mtrs response only retries its value',async()=>{
+ const labels=['B. S.','C of A','Kg','Kts','MoCTCA','Mtrs','kHz','m/s'];
+ const doc={schema:1,pages:[{number:1,blocks:labels.map((label,i)=>({id:'d'+i,type:'paragraph',
+  text:label+'\nSynthetic description '+i,translation_text:'Synthetic description '+i,
+  prefix:{kind:'definition',text:label,bbox:[72,100+i*20,130,114+i*20]},
+  definition:{label,label_bbox:[72,100+i*20,130,114+i*20],body_bbox:[144,100+i*20,400,114+i*20]},
+  flow_blocked:true}))}]};
+ const snapshot=JSON.stringify(doc),calls=[];
+ const result=await C.translateDocument(C.DEFAULT,'fixture-key',doc,{retryAttempts:5,retryDelayMs:1,
+  fetch:async(_url,options)=>{
+   const units=unitsFrom(options);calls.push(units.map(x=>x.id));
+   assert.ok(units.every(x=>/^Synthetic description \d$/.test(x.text)));
+   return envelope((calls.length===1?units.filter(x=>x.id!=='u5'):units).toReversed()
+    .map(x=>({...x,text:'独立释义'+x.id.slice(1)})));
+  }});
+ assert.deepEqual(calls,[labels.map((_,i)=>'u'+i),['u5']]);assert.equal(JSON.stringify(doc),snapshot);
+ result.document.translated_pages[0].blocks.forEach((b,i)=>{
+  assert.equal(b.translation_text,'独立释义'+i);assert.deepEqual(b.definition,doc.pages[0].blocks[i].definition);
+  assert.deepEqual(b.prefix,doc.pages[0].blocks[i].prefix);
+ });
+});
 test('image OCR lines are translated independently at unchanged source positions',async()=>{
  const doc={schema:1,pages:[{number:1,blocks:[{id:'image',type:'figure',text:'First\nSecond',
    layout_lines:[{text:'First',bbox:[0,0,100,12]},{text:'Second',bbox:[0,20,100,32]}]}]}]};
@@ -72,6 +129,47 @@ test('paragraph translation is coherent and retries only broken inline formula m
  assert.deepEqual(result.document.translated_pages[0].blocks[0].inline_math,doc.pages[0].blocks[0].inline_math);
 });
 const small={schema:1,pages:[{number:1,blocks:[{id:'a',type:'paragraph',text:'First'},{id:'b',type:'paragraph',text:'Second'}]}]};
+
+test('mixed prose keeps paired style markers and retries only damaged styles',async()=>{
+ const doc={schema:1,pages:[{number:1,blocks:[{id:'mixed',type:'paragraph',text:'Plain bold italic',
+  translation_text:'Plain [[S0]]bold[[/S0]] [[S1]]italic[[/S1]] [[M0]]',
+  text_styles:[{id:'S0',size:12,bold:true},{id:'S1',size:9,italic:true}],inline_math:[{id:'M0',bbox:[1,1,9,9]}]},
+  {id:'other',type:'paragraph',text:'Other'}]}]};
+ let calls=0;
+ const result=await C.translateDocument(C.DEFAULT,'fixture-key',doc,{retryAttempts:5,retryDelayMs:1,
+  fetch:async(_url,options)=>{
+   const units=unitsFrom(options);calls++;
+   assert.match(JSON.parse(options.body).messages[0].content,/style marker/);
+   if(calls>1)assert.deepEqual(units.map(u=>u.id),['u0']);
+   return envelope(units.map(u=>({...u,text:u.text==='Other'?'其他':calls===1?
+    '正文 [[/S0]]粗体[[S0]] [[S1]]斜体[[/S1]] [[M0]]':
+    '正文 [[S0]]粗体[[/S0]] [[S1]]斜体[[/S1]] [[M0]]'})));
+  }});
+ assert.equal(calls,2);
+ assert.deepEqual(result.document.translated_pages[0].blocks[0].text_styles,doc.pages[0].blocks[0].text_styles);
+ assert.equal(result.document.translated_pages[0].blocks[1].text,'其他');
+});
+
+test('chunk boundaries never bisect style or symbol marker tokens',()=>{
+ const text='a'.repeat(3996)+'[[S12]]bold[[/S12]] [[M0]]';
+ assert.equal(C.chunk(text).join(''),text);
+ for(const part of C.chunk(text))assert.doesNotMatch(part,/\[\[[^\]]*$/);
+});
+
+test('table cells use optional protected/style text without changing their topology',async()=>{
+ const cell={translation_text:'Location [[M0]] [[S0]]bold[[/S0]]',inline_math:[{id:'M0',bbox:[1,1,5,5]}],
+  text_styles:[{id:'S0',size:12,bold:true}]};
+ const doc={schema:1,pages:[{number:1,blocks:[{id:'table',type:'table',rows:[['Location 28 degrees bold','Other']],
+  cell_content:[[cell,null]],cells:[[[0,0,50,20],[50,0,100,20]]]}]}]};
+ const result=await C.translateDocument(C.DEFAULT,'fixture-key',doc,{fetch:async(_url,options)=>{
+  const units=unitsFrom(options);assert.equal(units[0].text,cell.translation_text);
+  return envelope(units.map(u=>({...u,text:'译文 '+u.text})));
+ }});
+ const out=result.document.translated_pages[0].blocks[0];
+ assert.equal(out.rows[0][0],'译文 '+cell.translation_text);
+ assert.deepEqual(out.cells,doc.pages[0].blocks[0].cells);
+ assert.deepEqual(out.cell_content,doc.pages[0].blocks[0].cell_content);
+});
 
 test('reordered structured IDs are mapped to their own source cells without dropping content',async()=>{
  const result=await C.translateDocument(C.DEFAULT,'fixture-key',fixture,{fetch:async(_url,options)=>

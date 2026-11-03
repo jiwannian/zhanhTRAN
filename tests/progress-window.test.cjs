@@ -70,7 +70,7 @@ test('completed messages persist, do not abort on close and close with their own
 test('unavailable dialog fails clearly and progress values cannot overflow',()=>{
  const {dialog,elements,progress}=fixture();progress.bind(dialog);
  progress.setProgress(120);assert.equal(elements['translation-percent'].textContent,'100%');
- progress.setProgress(-10);assert.equal(elements['translation-percent'].textContent,'0%');
+ progress.setProgress(-10);assert.equal(elements['translation-percent'].textContent,'100%');
  progress.setProgress(NaN);assert.equal(elements['translation-progress'].attributes.value,undefined);
  progress.close();
  const context={};vm.createContext(context);

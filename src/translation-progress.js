@@ -33,7 +33,8 @@
       }
       const progress=Object.freeze({
         setText(value){if(!closed){text=String(value);render();}},
-        setProgress(value){if(!closed){percent=Number.isFinite(value)?Math.max(0,Math.min(100,value)):null;render();}},
+        setProgress(value){if(!closed){const next=Number.isFinite(value)?Math.max(0,Math.min(100,value)):null;
+          percent=next===null?null:Math.max(percent || 0,next);render();}},
         bind(win) {
           if(closed || elements)return;
           const doc=win.document;

@@ -116,6 +116,14 @@
         const settings=(env.output || root.ZhanhTRANOutput).outputOptions(input);
         Z.Prefs.set('extensions.zotero.zhanhtran.output',JSON.stringify(settings),true);return settings;
       }
+      function translationConcurrency() {
+        const value=Z.Prefs.get('extensions.zotero.zhanhtran.translationConcurrency',true);
+        return Number.isInteger(value)&&value>=1&&value<=10?value:2;
+      }
+      function saveConcurrency(value) {
+        if(!Number.isInteger(value)||value<1||value>10)throw new Error('并发翻译请求数必须是 1–10 的整数');
+        Z.Prefs.set('extensions.zotero.zhanhtran.translationConcurrency',value,true);return value;
+      }
       function realm(p) { return p.id+'|'+p.baseURL; }
       async function logins(p) { return await S.logins.findLogins(ORIGIN,null,realm(p)); }
       async function keyFor(p) { return (await logins(p))[0]?.password || ''; }
@@ -144,7 +152,7 @@
       function checkAlive(signal) {
         if(!alive || signal?.aborted) throw new Error('翻译已取消');
       }
-      async function sourceFor(win,item,signal) {
+      async function sourceFor(win,item,signal,onProgress) {
         if(item.isNote()) throw new Error('请选择 PDF 或图片附件；笔记没有源文件类型，无法生成同类型文件');
         let attachment=item;
         if(item.isRegularItem()) {
@@ -156,7 +164,7 @@
           throw new Error('请选择 PDF、图片附件或含这些附件的文献条目');
         const path=await attachment.getFilePathAsync(); if(!path) throw new Error('附件文件不可用，请先下载');
         checkAlive(signal);
-        const document=await bridge.parseDocument(path,signal);
+        const document=await bridge.parseDocument(path,signal,onProgress);
         checkAlive(signal);
         const extension=path.match(/\.(pdf|png|jpe?g|tiff?|bmp|webp)$/i)?.[1].toLowerCase();
         const types={pdf:'application/pdf',png:'image/png',jpg:'image/jpeg',jpeg:'image/jpeg',tif:'image/tiff',tiff:'image/tiff',bmp:'image/bmp',webp:'image/webp'};
@@ -164,7 +172,7 @@
         return {document,contentType:types[extension],sourcePath:path,isPDF:extension==='pdf',title:attachment.getField('title') || '文档',parentID:attachment.parentID || null,
           libraryID:attachment.libraryID,collections:attachment.parentID?[]:(attachment.getCollections?.() || [])};
       }
-      async function createFileAttachments(source,result,paths,signal) {
+      async function createFileAttachments(source,result,paths,signal,onProgress) {
         if(!/^(application\/pdf|image\/(png|jpeg|tiff|bmp|webp))$/.test(source.contentType))throw new Error('本地解析文件类型无效');
         const ids=[];
         try {
@@ -179,6 +187,7 @@
             ids.push(attachment.id);checkAlive(signal);
             attachment.setField('title',source.title+' — '+label+' · '+result.provider+' · '+result.model);
             await attachment.saveTx();
+            onProgress?.(ids.length,Object.keys(paths).length);
           }
           checkAlive(signal);return ids;
         } catch(error) {
@@ -194,24 +203,35 @@
         let progress;
         try {
           checkAlive(controller.signal);
-          const output=outputSettings();const p=selected(); const key=await keyFor(p);
+          const output=outputSettings(),concurrency=translationConcurrency();const p=selected(); const key=await keyFor(p);
           checkAlive(controller.signal);
           if(!key) { S.prompt.alert(win,'zhanhTRAN','请先保存自定义供应商 API 密钥');openSettings(win);return; }
           const owned=messages.get(win) || new Set();messages.set(win,owned);
           progress=createProgress(win,controller,()=>{owned.delete(progress);if(!owned.size)messages.delete(win);});
           owned.add(progress);checkAlive(controller.signal);
-          const source=await sourceFor(win,items[0],controller.signal);
-          const options={fetch:env.fetch,signal:controller.signal,retryAttempts:5,
+          progress.setProgress(0);
+          const source=await sourceFor(win,items[0],controller.signal,({done,total})=>{
+            progress.setText('本地解析 '+done+'/'+total+' 页');if(total>0)progress.setProgress(20*done/total);
+          });
+          progress.setProgress(20);progress.setText('模型翻译…');
+          const options={fetch:env.fetch,signal:controller.signal,retryAttempts:5,concurrency,
             onRetry:(attempt,total,reason)=>progress.setText(reason+'，重试 '+attempt+'/'+total+'…'),
-            onProgress:(done,total)=>{progress.setText('模型翻译 '+done+'/'+total);progress.setProgress(done/total*100);}};
+            onTranslationProgress:(done,total,units,all)=>{progress.setText('模型翻译 '+units+'/'+all+' 项');progress.setProgress(20+60*done/total);},
+            onProgress:(done,total)=>{progress.setText('模型翻译 '+done+'/'+total+' 批');progress.setProgress(20+60*done/total);}};
           const result=await C.translateDocument(p,key,source.document,options);
           checkAlive(controller.signal);
           await bridge.saveResult(source.document,result);
           progress.setText('正在生成同类型译文 / 双语文件…');
-          const paths=await bridge.exportFile(source.document,controller.signal,output);
+          progress.setProgress(80);
+          const paths=await bridge.exportFile(source.document,controller.signal,output,({done,total})=>{
+            progress.setText('排版 '+done+'/'+total+' 页组');if(total>0)progress.setProgress(80+16*done/total);
+          });
           const selectedPaths=Object.fromEntries(Object.entries(paths).filter(([kind])=>output[kind]===true));
           checkAlive(controller.signal);
-          await createFileAttachments(source,result,selectedPaths,controller.signal);
+          progress.setProgress(98);progress.setText('正在导入文件附件…');
+          await createFileAttachments(source,result,selectedPaths,controller.signal,(done,total)=>{
+            progress.setText('导入附件 '+done+'/'+total);progress.setProgress(Math.min(99,98+done/total));
+          });
           progress.setText('已创建'+(output.translated&&output.bilingual?'译文与双语':output.translated?'译文':'双语')+'文件附件');
           progress.setProgress(100);
         } catch(error) {
@@ -317,6 +337,11 @@
         python.value=Z.Prefs.get('extensions.zotero.zhanhtran.localPython',true) || '';
         python.addEventListener('change',()=>{Z.Prefs.set('extensions.zotero.zhanhtran.localPython',python.value.trim(),true);});
         field(local.node,'Python 路径',python);
+        const performance=section('翻译速度');const concurrency=el('input');concurrency.id='zhanhtran-translation-concurrency';
+        concurrency.type='number';concurrency.min='1';concurrency.max='10';concurrency.step='1';concurrency.value=translationConcurrency();
+        field(performance.node,'并发翻译请求数',concurrency);
+        concurrency.addEventListener('change',()=>{try{saveConcurrency(Number(concurrency.value));}
+          catch(error){concurrency.value=translationConcurrency();}});
         let editingID;let controller;
         function load(p) { editingID=p.id;for(const name of ['name','baseURL','model','language'])fields[name].value=p[name];for(const radio of Object.values(protocolFields))radio.checked=radio.value===p.protocol;fields.key.value=''; }
         function refresh() { selector.replaceChildren();const state=configState();for(const p of state.providers){const op=el('option',p.name+' · '+p.model);op.value=p.id;selector.appendChild(op);}selector.value=state.selected;load(selected()); }
@@ -351,7 +376,7 @@
         win.addEventListener('unload',()=>{controller?.abort();fields.key.value='';},{once:true});refresh();
       }
       const api=Object.freeze({configState,selected,save,remove,keyFor,mount,openSettings,outputSettings,saveOutput,
-        translateSelected,registerWindow,unregisterWindow,createFileAttachments,sourceFor,
+        translateSelected,registerWindow,unregisterWindow,createFileAttachments,sourceFor,translationConcurrency,saveConcurrency,
         shutdown(){alive=false;for(const win of new Set([...windows.keys(),...jobs.keys(),...messages.keys()]))unregisterWindow(win);}});
       return api;
     }

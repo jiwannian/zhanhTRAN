@@ -24,7 +24,7 @@ class PackageTests(unittest.TestCase):
             with zipfile.ZipFile(first) as archive:
                 manifest = json.loads(archive.read('manifest.json'))
                 self.assertEqual(manifest['name'], 'zhanhTRAN')
-                self.assertEqual(manifest['version'], '1.0.1')
+                self.assertEqual(manifest['version'], '1.0.23')
                 self.assertEqual(len(archive.namelist()), len(set(archive.namelist())))
                 self.assertIn('LICENSE', archive.namelist())
                 self.assertIn('chrome/content/scripts/output-settings.js', archive.namelist())

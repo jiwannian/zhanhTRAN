@@ -21,7 +21,7 @@ async function fixture(t,copy,failure){
    const folder=args[args.indexOf('--output')+1];await fs.mkdir(folder,{recursive:true});
    let result={};
    if(args.includes('--document')){
-    if(failure)result={ok:false,error:failure};
+    if(failure)result={ok:false,...(typeof failure==='string'?{error:failure}:failure)};
     else{
     result={ok:true,translated:path.join(folder,'source-translated.pdf'),bilingual:path.join(folder,'source-bilingual.pdf')};
     for(const file of [result.translated,result.bilingual])await fs.writeFile(file,'%PDF-1.7 fixture generated output');
@@ -53,6 +53,14 @@ test('PDF overlap failure is actionable and never publishes sidecars',async t=>{
 test('unexpected PDF errors never expose external error text',async t=>{
  const f=await fixture(t,null,'private document text or key');
  await assert.rejects(f.bridge.exportPDF(f.doc),error=>/检查文档结构和本地依赖/.test(error.message)&&!error.message.includes('private'));
+});
+
+test('PDF layout failure identifies the page and region without exposing arbitrary region text',async t=>{
+ for(const [region,shown] of [['p8-b5-toc0',true],['private document/key',false]]){
+  const f=await fixture(t,null,{error:'PDF_TEXT_DOES_NOT_FIT',failed_page:8,region});
+  await assert.rejects(f.bridge.exportPDF(f.doc),error=>/第 8 页/.test(error.message)&&
+   error.message.includes('p8-b5-toc0')===shown&&!error.message.includes('private'));
+ }
 });
 
 test('second copy failure removes only the new first sidecar',async t=>{

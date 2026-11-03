@@ -9,11 +9,21 @@
     const {IO,join,normalize,Subprocess}=env;
     const issued=new Map();
     const check=signal=>{if(signal?.aborted)throw new Error('翻译已取消');};
-    async function readPipe(pipe){
-      let output='',part;
+    async function readPipe(pipe,onProgress){
+      let output='',part,pending='';
       while((part=await pipe.readString())!==''){
         if(output.length+part.length>262144)throw new Error('本地解析日志超过限制');
         output+=part;
+        if(onProgress){
+          pending+=part;let end;
+          while((end=pending.indexOf('\n'))>=0){
+            const line=pending.slice(0,end);pending=pending.slice(end+1);
+            if(!line.startsWith('ZHANHTRAN_PROGRESS '))continue;
+            let event;try{event=JSON.parse(line.slice(19));}catch(_){continue;}
+            if(Number.isInteger(event.done)&&Number.isInteger(event.total)&&event.total>0&&event.done>=0&&event.done<=event.total)
+              onProgress(event);
+          }
+        }
       }
       return output;
     }
@@ -21,7 +31,7 @@
       if(!issued.has(doc?.output_dir))throw new Error('本地解析结果目录无效');
       return doc.output_dir;
     }
-    async function parseDocument(path,signal){
+    async function parseDocument(path,signal,onProgress){
       check(signal);
       if(typeof path!=='string' || !/\.(pdf|png|jpe?g|tiff?|bmp|webp)$/i.test(path) || /[\x00-\x1f]/.test(path))
         throw new Error('本地解析文件类型无效');
@@ -37,12 +47,12 @@
       try{
         await IO.writeUTF8(script,await env.scriptText());
         check(signal);
-        process=await Subprocess.call({command:python,arguments:['-I',script,'--input',path,'--output',output],
+        process=await Subprocess.call({command:python,arguments:['-I',script,'--input',path,'--output',output,...(onProgress?['--progress']:[])],
           environment:{...env.environment,PYTHONUTF8:'1',PYTHONIOENCODING:'utf-8'},environmentAppend:false,stderr:'pipe'});
         signal?.addEventListener('abort',abort,{once:true});
         if(signal?.aborted)abort();
         timer=env.setTimeout(()=>{timedOut=true;abort();},1200000);
-        const [status,stdout]=await Promise.all([process.wait(),readPipe(process.stdout),readPipe(process.stderr)]);
+        const [status,stdout]=await Promise.all([process.wait(),readPipe(process.stdout),readPipe(process.stderr,onProgress)]);
         check(signal);
         if(timedOut)throw new Error('本地解析超时，请拆分文档');
         if(status.exitCode!==0){
@@ -104,7 +114,7 @@
         throw new Error(label+' 无法保存到源文件目录，请检查目录写入权限或同名文件',{cause:error});
       }
     }
-    async function exportFile(doc,signal,settings={translated:true,bilingual:true,order:'original-left'}){
+    async function exportFile(doc,signal,settings={translated:true,bilingual:true,order:'original-left'},onProgress){
       check(signal);
       if(typeof settings.translated!=='boolean'||typeof settings.bilingual!=='boolean'||(!settings.translated&&!settings.bilingual)||
         !['original-left','translated-left'].includes(settings.order))throw new Error('输出设置无效');
@@ -122,18 +132,22 @@
       const abort=()=>{if(process)void process.kill(0).catch(()=>{});};
       try{
         await IO.writeUTF8(join(folder,'local_pdf.py'),await env.pdfScriptText());
+        if(isPDF)await IO.writeUTF8(join(folder,'local_parser.py'),await (env.metadataScriptText || env.scriptText)());
         if(!isPDF)await IO.writeUTF8(script,await env.imageScriptText());
         check(signal);
         process=await Subprocess.call({command:python,arguments:['-I',script,'--input',source,
-          '--document',join(folder,'translated.json'),'--output',folder,'--outputs',Object.keys(paths).join(','),'--order',settings.order],
+          '--document',join(folder,'translated.json'),'--output',folder,'--outputs',Object.keys(paths).join(','),'--order',settings.order,...(onProgress?['--progress']:[])],
           environment:{...env.environment,PYTHONUTF8:'1',PYTHONIOENCODING:'utf-8'},environmentAppend:false,stderr:'pipe'});
         signal?.addEventListener('abort',abort,{once:true});if(signal?.aborted)abort();
         timer=env.setTimeout(()=>{timedOut=true;abort();},1200000);
-        const [status,stdout]=await Promise.all([process.wait(),readPipe(process.stdout),readPipe(process.stderr)]);
+        const [status,stdout]=await Promise.all([process.wait(),readPipe(process.stdout),readPipe(process.stderr,onProgress)]);
         check(signal);if(timedOut)throw new Error(label+' 排版超时，请拆分文档');
         let result;try{result=JSON.parse(stdout.trim());}catch(_){}
         if(status.exitCode!==0 || !result?.ok){
-          const labels={PDF_TEXT_DOES_NOT_FIT:'译文无法在原文区域内完整排版，请使用更精简的译文',
+          const labels={PDF_TEXT_DOES_NOT_FIT:'译文无法完整排入固定区域，具体区域已记录在 pdf-layout-failure.json',
+            PDF_GLYPH_MISSING:'译文存在缺失字形，具体区域已记录在 pdf-layout-failure.json',
+            PDF_LAYOUT_NUMERIC_INVALID:'固定区域排版数值失效，具体区域已记录在 pdf-layout-failure.json',
+            PDF_INLINE_SYMBOL_INVALID:'受保护符号不完整，具体区域已记录在 pdf-layout-failure.json',
             PDF_SOURCE_CHANGED:'原 PDF 已变化，请重新翻译',PDF_OCR_TRANSLATION_INCOMPLETE:'图片文字译文不完整，请重新翻译',
             PDF_OVERLAPPING_TRANSLATIONS:'原文文本区域重叠，请使用新版插件重新解析并翻译',
             PDF_PROTECTED_FORMULA_OVERLAP:'译文区域与公式重叠，请检查文档版式',
@@ -145,7 +159,9 @@
             IMAGE_TRANSLATION_INCOMPLETE:'图片文字译文不完整，请重新翻译',IMAGE_SOURCE_INVALID:'图片帧数与解析结果不符，请重新翻译',
             IMAGE_PIXEL_LIMIT:'图片总像素超过限制，请拆分多帧图片',IMAGE_OUTPUT_EXISTS:'输出文件已存在，请重新启动任务',
             IMAGE_OUTPUT_INVALID:'图片输出无效，请检查目录',IMAGE_DOCUMENT_TOO_LARGE:'图片结构超过 64 MB，请拆分'};
-          throw new Error(label+' 生成失败：'+(labels[result?.error] || '请检查文档结构和本地依赖'));
+          const where=Number.isInteger(result?.failed_page)&&result.failed_page>0?
+            '（第 '+result.failed_page+' 页'+(/^[a-zA-Z0-9_-]{1,80}$/.test(result.region || '')?'，区域 '+result.region:'')+'）':'';
+          throw new Error(label+' 生成失败：'+(labels[result?.error] || '请检查文档结构和本地依赖')+where);
         }
         for(const [kind,path] of Object.entries(paths)){
           if(normalize(result[kind])!==normalize(path) || !await IO.exists(path) || (await IO.stat(path)).size<20)

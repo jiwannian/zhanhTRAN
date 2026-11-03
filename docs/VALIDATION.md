@@ -1,56 +1,70 @@
-# zhanhTRAN 1.0.1 Validation
+# 1.0.23 验证记录
 
-Validated on 2026-10-13 using synthetic documents and a loopback-only mock provider.
-No real model provider, personal paper, or daily Zotero profile was used.
+日期：2026-11-03。手动安装交付，不更新日常 Zotero。
 
-## Results
+## 原因与修复
 
-| Layer | Observed result |
+三张截图中的问题来自 1.0.22 缩写识别过窄：仅接收全大写、没有空格或末尾句点的键，并要求至少两倍字号的列间距。因此 B. S.、C of A、Kg、Kts、MoCTCA、Mtrs 漏识别；B. S. 的 B. 还被误当作列表编号，MoCTCA/Mtrs 被合并为连续正文。已只读核对当前启用版本为 1.0.22，以及现有任务 JSON 中这几类缩写的有限坐标、样式和前缀元数据；未重新解析、渲染或导出用户论文，未更改日常配置或缓存。
+
+1. 根据重复的缩写列起点、释义列起点、源基线和物理间隔判断两列条目，不再以全大写为条件。覆盖空格、末尾句点、大小写混合、小写单位、单字符单位、斜线及数字组合；不逐条硬编码本次缩写。
+2. 检查多个候选间隔后选择获得重复列位置支持的完整键，保留键内空格与句点。长键后较窄的间隔也可由相邻条目确认，不再硬性要求两倍字号。仅用于重复结构判断的横坐标容差不会移动条目；每条释义保留自己的源起点，包括合成用例中 3 pt 的差异。
+3. 缩写复用原 PDF 字形、字号和位置，只翻译对应释义。源释义续行归属本条，下一条不合并。多字体片段间仅以定位表示的键内空格也能归入完整缩写，不把 B. 当成独立列表编号。
+4. 旧缓存中已正确识别的缩写行可作为列位置参考，但不重复替换或输出。对漏识别区域本地补取源结构，在键唯一、齐全、顺序正确且释义非空时拆分已有译文。
+5. 仅在源 PDF 的完整键、旧列表前缀位置和旧请求内容都能确认时，移除旧 B. S. 请求中残留的 S.。模型省略键或省略键内空格时仍保留完整原生键；源无法确认的内容不猜测删除。
+6. 缺失、重复、乱序的旧缓存键、空释义、损坏几何或无法归属的旧样式/符号标记继续明确失败，报告具体页与区域，不生成部分文件。只消费完整覆盖的源文本块，普通正文、单个宽标题和真实双栏不因缩写开头就变成缩写表。
+
+固定原区域、区域内统一缩字、无字号下限、不扩框、不挤图注、不新增页的规则不变。普通正文及同一列表项继续按段落排版，没有退回所有正文按源视觉行分别翻译。
+
+schema 仍为 1，没有新增设置或桥接接口。供应商、密钥、Python 路径、输出选项、并发默认 2/最高 10、独立图片生产代码及现有翻译请求逻辑均未修改。
+
+## 验证结果
+
+仅运行本轮修改及关联部分；所有验证 PDF 均为每份 1–3 页的小型合成材料，不使用用户论文或其他大论文。使用预设中文响应和模拟供应商，不据此评价真实供应商的翻译质量。
+
+| 范围 | 结果 |
 | --- | --- |
-| JavaScript unit/integration/browser tests | 99 passed; Node line coverage 91.41%, branch coverage 86.63% |
-| Python parsing/layout/package tests | 141 passed; source line coverage 94% |
-| Local PDF renderer | 91% line coverage; complete short-box translation and collision refusal covered |
-| Isolated Zotero 10.0.6 | 11 PDF/OCR/image/rotation/output cases passed |
-| Native reliability | 6 retry/timeout/cancel cases passed; retry limit is six total requests |
-| Settings | Independent window and preference pane, icons and both protocol routes passed |
-| Output invariants | No added notes, unchanged source bytes, correct file type/parent/library, safe sidecars |
-| Packaging | Reproducible XPI; 26 unique members; Git-tracked bytes match tested source |
-| Linux GitHub Actions | 99 JavaScript and 141 Python tests passed; Python source coverage 94% |
-| Publication boundary | Source and unpacked XPI scanned before publishing; no credentials or private machine configuration |
-| Dependency audit | npm: no vulnerabilities; pip-audit: no known vulnerabilities in the seven pinned direct requirements |
+| Python 缩写表、解析、固定排版、正文连续性、目录、表格、符号、CLI、打包 | 183 项通过，新增混合缩写回归 12 项 |
+| JavaScript 结构化翻译、乱序回填、补译、并发、输出和真实 Python 桥接 | 61 项通过，新增混合缩写和 Mtrs 缺条补译 1 项 |
+| 隔离 Zotero 10.0.7 中实际 1.0.23 XPI 的解析/导出桥接 | 92 个场景通过，无供应商请求 |
+| Poppler 渲染并逐图目检 | 14 组合成材料、32 张整页及细节对照面板通过 |
+| 相对实际归档 1.0.22 的补丁和源码 ZIP | 补丁可应用、逐文件相同，两者均可重建同字节 XPI |
 
-Node's coverage report includes the bundled parser and fixture helper but excludes VM-loaded
-Zotero adapter code and browser code from its denominator. Python coverage covers the three
-production Python modules. Browser/native tests exercise settings and host integration separately.
-Dependency audit results are time-specific, not a permanent security guarantee; Python transitive
-dependencies were not included in the direct-requirement audit.
+92 个隔离场景：混合缩写 4、旧混合缩写缓存 4、多字体分段键 4、小写/单字符单位 4；已有缩写行、旧缩写缓存、按列写入、源释义续行、混合样式缩写各 4；新/旧数字列表和新/旧上标基线各 4；新/旧正文连续性各 4；源几何 8、条件正文 8；双图图注、坐标符号、私有字体列表标记及旧符号缓存各 4。新输入调用实际 XPI 解析器，旧输入仅注入合成 schema 1 缓存。覆盖 0/90 度及双语两种左右顺序。
 
-## Installable Artifact
+Python 另覆盖 180/270 度、3 页材料、下一源页分页、书签和内部链接、原 PDF 字节不变、双语原文侧不变、每个键的源像素、释义原基线和原横坐标、原 12 pt 字号、逐条文字严格对应与缺字检查。极长 Mtrs 释义在自身固定区域缩到低于原字号 50%，不影响原生键、下一行、图形及图注。CLI 单行 JSON stdout 和独立 stderr 进度保持通过。
 
-- File: `zhanhTRAN-1.0.1.xpi`
-- Size: 87,432 bytes
-- SHA-256: `6963efd48d52b9e2b4fe936bca6650909652fa499dc3b97d6575ee416862321c`
+### 归档 1.0.22 / 1.0.23 同输入 A/B
 
-The final package was tested in a fresh isolated Zotero profile and rebuilt with identical bytes.
-Raw local logs, screenshots, profiles and generated fixtures are intentionally not published.
-Run the checked-in test tools to produce independent evidence.
+两版使用相同的 3 页合成源 PDF 字节，以及实际归档 1.0.22 解析器生成的相同译文缓存 JSON，不请求新翻译。
 
-## Release Regression Fixes
+- 共有 19 个缩写条目，合成释义不使用论文原文。
+- 旧版仅 12 条带有缩写行结构；B. S.、C of A、Kg、Kts 释义跑到左侧；MoCTCA 与 Mtrs 出现在同一视觉行。
+- 新版恢复 19 个独立条目；键保留源字形和位置，普通释义均为 12 pt，分别从源 144 pt 或 141 pt 列起点排版。Mtrs 回到自己的源行，B. S. 不在右列残留 S.。
+- 两版输出均可提取到全部预设合成释义；新版另外逐行核对键和释义，避免将“文字仍在但并错行”判为排版成功。
+- 源 PDF 与输入缓存对象均未改变，输出均为 3 页，不新增续页。不能可靠拆分的旧缓存仍要求重新翻译。
 
-Fresh parser and exporter processes must emit exactly one JSON object on stdout.
-The optional PyMuPDF layout recommendation is disabled through its supported
-environment setting before import; it must not corrupt the bridge protocol.
-Three subprocess regression tests first failed, then passed with the fix.
+同一份 3 页合成材料进行交替计时，各版预热一次后取 3 次中位数：1.0.22 为 0.086134 秒，1.0.23 为 0.090669 秒；识别条目由 12 增至 19。仅是小样本性能记录，不代表大文档速度或本轮提速结论。底层每页提取复用回归仍通过。
 
-Bridge tests resolve an absolute Python executable instead of relying on shell
-lookup. The native harness waits for both library trees and item loading before
-selecting an attachment; window creation alone does not imply the UI is ready.
-These checks passed on the final package in a fresh isolated Zotero profile.
+### 排版复查
 
-## Limits
+- 目录：编号、层级缩进、引导点和页码位置保持。
+- 左侧突出：时间开头、首行/悬挂缩进保持；新增键不进入释义正文，也不强制将源本来不同的列起点改成一个坐标。
+- 符号：源坐标、引号、分秒符号、U+201F 及私有字体列表标记保持原外观，未接受 .notdef 白框。
+- 字号/样式：同一区域统一缩放，保留粗斜体和相对字号。本轮普通缩写释义保持 12 pt；刻意超长内容按原规则缩字。
+- 双图、各自图注、脚注和页码未被正文挤占；普通段落仍连续排版。
 
-Zotero 9 is declared compatible but has not been tested on a real host. Native tests were on
-Windows; Linux CI covers parsing, layout and browser tests, not a native Zotero host.
-Group-library import has mocked coverage, not a real group-account acceptance test.
-Controlled translations verify plumbing/completeness, not real-provider linguistic quality.
-OCR, complex tables and page geometry remain subject to the limits described in the README.
+没有对用户论文重新导出验收，不宣称已验证所有 PDF 结构。
+
+## 交付与安装
+
+- dist/zhanhTRAN-1.0.23.xpi
+- dist/zhanhTRAN-1.0.23-source.zip
+- dist/zhanhTRAN-1.0.22-to-1.0.23.patch
+- dist/zhanhTRAN-1.0.23-validation.md
+- dist/zhanhTRAN-1.0.23-validation.zip
+
+每项附 .sha256。XPI SHA-256：5d478b1d785460c7fddc546797ab54cc47633d594074bbd2bd3ffa2229205a53。
+
+补丁以实际归档 1.0.22 源码 ZIP 为基线，不使用工作区 Git HEAD。隔离应用后逐文件相同，同一 Python/压缩环境从补丁或源码 ZIP 均可重建同字节安装包。验证 ZIP 只含合成材料、输出、渲染图片和测试记录，不含论文、密钥或日常配置。
+
+在 Zotero“工具 → 插件 → 从文件安装”中选择 1.0.23 XPI，重启后重新发起翻译；已生成的旧文件不会自动改变。未自动安装、未修改日常配置或任务缓存、未上传 GitHub Release。Zotero 9 的兼容声明不变，未实机验证。

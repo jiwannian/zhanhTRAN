@@ -13,6 +13,7 @@ The XPI contains Python scripts, not dependency binaries or OCR model weights. I
 | Dependency | License | Project |
 | --- | --- | --- |
 | PyMuPDF / MuPDF | AGPL-3.0 or Artifex commercial license | https://github.com/pymupdf/PyMuPDF |
+| fontTools | MIT | https://github.com/fonttools/fonttools |
 | Pillow | MIT-CMU | https://github.com/python-pillow/Pillow |
 | NumPy | BSD-3-Clause, with distribution-specific notices | https://github.com/numpy/numpy |
 | RapidOCR ONNX Runtime | Apache-2.0 | https://github.com/RapidAI/RapidOCR |

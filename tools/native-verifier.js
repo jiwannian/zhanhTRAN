@@ -73,10 +73,145 @@ async function verify(){
   check(win.ZoteroPane?.itemsView&&win.ZoteroPane?.collectionsView?.itemTreeView,'main library trees not ready');
   await win.ZoteroPane.itemsView.waitForLoad();
   const addon=await AddonManager.getAddonByID('zhanhtran@zhanh.local');
-  report.configuration={model:api.selected().model,output:api.outputSettings(),keyReadback:(await api.keyFor(provider))==='qa-fixture-only'};
-  check(report.configuration.keyReadback&&report.configuration.output.order==='original-left','independent configuration failed');
+  report.pluginVersion=addon.version;
+  report.configuration={model:api.selected().model,output:api.outputSettings(),
+   concurrency:api.translationConcurrency(),python:Zotero.Prefs.get('extensions.zotero.zhanhtran.localPython',true)===cfg.python,
+   keyReadback:(await api.keyFor(provider))==='qa-fixture-only'};
+  check(addon.version===cfg.version&&report.configuration.keyReadback&&report.configuration.python&&
+   report.configuration.concurrency===2&&report.configuration.output.order==='original-left','independent configuration failed');
   report.backgroundUpdatesDisabled=addon.applyBackgroundUpdates===AddonManager.AUTOUPDATE_DISABLE;
   check(report.backgroundUpdatesDisabled,'background updates enabled');
+  // Exact tight-box geometry is deterministic fixture metadata, not OCR output
+  // from a paper. Exercise the bridge using Python code from the installed XPI.
+  const ctx={};ctx._globalThis=ctx;
+  Services.scriptloader.loadSubScriptWithOptions('chrome://zhanhtran/content/scripts/local-parser-zotero.js',
+   {target:ctx,ignoreCache:true});
+  const {Subprocess}=ChromeUtils.importESModule('resource://gre/modules/Subprocess.sys.mjs');
+  const {NetUtil}=ChromeUtils.importESModule('resource://gre/modules/NetUtil.sys.mjs');
+  const readScript=name=>new Promise((resolve,reject)=>NetUtil.asyncFetch({
+   uri:Services.io.newURI('chrome://zhanhtran/content/scripts/'+name),loadUsingSystemPrincipal:true},(stream,status)=>{
+    try{check(Components.isSuccessCode(status),'packaged script unavailable');
+     resolve(NetUtil.readInputStreamToString(stream,stream.available(),{charset:'UTF-8'}));}
+    catch(error){reject(error);}finally{stream?.close();}
+   }));
+  const bridgeEnv={IO:IOUtils,Subprocess,profileDir:profile,
+   join:(...parts)=>PathUtils.join(...parts),dirname:PathUtils.parent,normalize:PathUtils.normalize,
+   uuid:()=>Services.uuid.generateUUID().toString(),setTimeout,clearTimeout:ChromeUtils.importESModule('resource://gre/modules/Timer.sys.mjs').clearTimeout,
+   environment:Object.fromEntries(Object.entries(Subprocess.getEnvironment()).filter(([key])=>/^(PATH|SYSTEMROOT|WINDIR|TEMP|TMP|USERPROFILE|HOME)$/i.test(key))),
+   python:()=>cfg.python,scriptText:()=>IOUtils.readUTF8(cfg.tightFixtureParser),
+   metadataScriptText:()=>readScript('local_parser.py'),pdfScriptText:()=>readScript('local_pdf.py'),imageScriptText:()=>readScript('local_image.py')};
+  const bridge=ctx.ZhanhTRANLocalParser.install(bridgeEnv);
+  const realBridge=ctx.ZhanhTRANLocalParser.install({...bridgeEnv,scriptText:()=>readScript('local_parser.py')});
+  const groups=[['tightOCR','tightFixtures'],['mixedOCR','mixedFixtures'],['inkOCR','inkFixtures'],
+   ['precisionOCR','precisionFixtures'],['cjkOCR','cjkFixtures'],['edgeOCR','edgeFixtures'],
+   ['quadOCR','quadFixtures'],['flowGeometry','geometryFixtures'],['tableFlow','tableFixtures'],
+   ['detectedQuadOCR','detectedQuadFixtures'],['conditionalProse','conditionalFixtures'],
+   ['fixedCaptions','captionFixtures'],['fixedSymbols','symbolFixtures'],
+   ['prefixSymbols','prefixFixtures'],['cachedPrefixSymbols','cachedPrefixFixtures'],
+   ['paragraphFlow','paragraphFixtures'],['cachedParagraphFlow','cachedParagraphFixtures'],
+   ['numberedFlow','numberedFixtures'],['cachedNumberedFlow','cachedNumberedFixtures'],
+   ['raisedBaseline','raisedFixtures'],['cachedRaisedBaseline','cachedRaisedFixtures'],
+   ['definitionRows','definitionFixtures'],['cachedDefinitionRows','cachedDefinitionFixtures'],
+   ['columnDefinitions','columnDefinitionFixtures'],['wrappedDefinitions','wrappedDefinitionFixtures'],
+   ['styledDefinitions','styledDefinitionFixtures'],
+   ['variantDefinitions','variantDefinitionFixtures'],['cachedVariantDefinitions','cachedVariantDefinitionFixtures'],
+   ['splitDefinitionKeys','splitKeyFixtures'],['unitDefinitions','unitDefinitionFixtures']];
+  for(const [category,field] of groups){
+   if(cfg.layoutGroups?.length&&!cfg.layoutGroups.includes(category))continue;
+   report[category]=[];
+   const real=['detectedQuadOCR','conditionalProse','fixedCaptions','fixedSymbols','prefixSymbols','paragraphFlow',
+    'numberedFlow','raisedBaseline','definitionRows','columnDefinitions','wrappedDefinitions','styledDefinitions',
+    'variantDefinitions','splitDefinitionKeys','unitDefinitions'].includes(category);
+   const active=real?realBridge:bridge;
+   for(const fixture of cfg[field] || [])for(const order of ['original-left','translated-left']){
+    report.stage=category+':'+fixture.source.split(/[\\/]/).pop()+':'+order;await write();
+    const parseProgress=[],exportProgress=[];
+    const document=await active.parseDocument(fixture.source,undefined,e=>parseProgress.push(e));
+    if(real){
+     document.translated_pages=JSON.parse(JSON.stringify(document.pages));
+     for(const page of document.translated_pages)for(const block of page.blocks){
+      const text=block.text?.replace(/\s+/g,' ')||'';
+      if(category==='detectedQuadOCR')for(const line of block.layout_lines || []){
+       if(line.text==='SAMPLE')line.text='示例';
+      }
+      if(category==='conditionalProse'){
+       if(text.startsWith('Sample readings'))block.text='如果检验正确，AB 21、CD、EF 与 GH 的样本读数遵循新的参照顺序。'.repeat(fixture.overflow?60:2);
+       else if(text.startsWith('Synthetic following'))block.text='后续合成段落保持原字号并向下顺延。';
+       else if(text.startsWith('Synthetic next'))block.text='下一原文页从新的译文页组开始。';
+      }
+      if(category==='paragraphFlow'){
+       if(block.bbox[1]>130&&block.bbox[1]<160){
+        const prose='合成正文连续排版，不按句号或模型换行拆成独立文本框。'.repeat(4);
+        block.text=prose.slice(0,30)+'\n\n'+prose.slice(30,65)+'\n'+prose.slice(65);
+       }else if(block.bbox[1]>130&&block.bbox[1]<400)block.text='下一段保留原文的段落边界，不接在上一段句末。';
+       else if(text.startsWith('Figure 1'))block.text='图1：独立图注保留位置。';
+       else if(text.startsWith('Synthetic separate'))block.text='合成脚注保持原位。';
+       else if(text.startsWith('Synthetic next'))block.text='下一页仍另起。';
+      }
+      if((category==='numberedFlow'||category==='raisedBaseline')&&block.bbox[1]>95&&
+       block.bbox[1]<(category==='numberedFlow'?610:220)){
+       const prose=(category==='numberedFlow'?
+        '合成列表正文连续排版，不因首行编号或句末而提前另起一行。':
+        '合成正文按主要文字的基线识别续行，不用上标字形的顶部作为段落间距。').repeat(4);
+       const field='translation_text' in block?'translation_text':'text';
+       block[field]=prose.slice(0,21)+'\n\n'+prose.slice(21,53)+'\n'+prose.slice(53);block.text=block[field];
+      }
+      if(['definitionRows','columnDefinitions','wrappedDefinitions','styledDefinitions'].includes(category)&&block.definition){
+       const labels=['SB','SOP','TAWS','TCSN','TSIB','TTSN','VNPR','VFR'];
+       const values=['合成基线','合成观察流程','合成参照序列与校准数据','测试循环计数',
+        '合成参照序列与校准记录','测试累计时间','合成参照序列与校准位置','可视样本规则'];
+       let value=values[labels.indexOf(block.definition.label)];
+       if(block.inline_math?.length||block.text_styles?.length){
+        value='合成坐标 '+(block.translation_text.match(/\[\[(?:\/?S\d+|M\d+)\]\]/g)||[])
+         .map(m=>m+(/^\[\[S\d+\]\]$/.test(m)?'强调记录':'')).join('');
+       }
+       check(typeof value==='string','unexpected definition key');block.translation_text=value;block.text=value;
+      }
+      if(['variantDefinitions','splitDefinitionKeys','unitDefinitions'].includes(category)&&block.definition){
+       const values={'ATC':'合成控制站','ATPL':'合成运输许可','ATS':'合成交通服务','B. S.':'合成历法标准',
+        'C of A':'合成检验证书','CAAN':'合成地区机构','CFIT':'合成样本条件','ICAO':'合成国际组织',
+        'IFR':'合成仪表规则','IP':'合成教学角色','Kg':'合成质量单位','Kts':'合成速度单位','LH':'合成左侧',
+        'LT':'合成本地计时','MOC':'合成变更记录','MoCTCA':'合成地区校准与样本机构','Mtrs':'合成距离单位',
+        'N/A':'合成不可用值','NTSB':'合成研究委员会','kHz':'合成频率单位','ft':'合成长度单位',
+        'm':'合成公制单位','m/s':'合成速率单位','v2':'合成版本标记'};
+       const value=values[block.definition.label];check(typeof value==='string','unexpected variant key');
+       block.translation_text=value;block.text=value;
+      }
+      if(category==='fixedCaptions'){
+       if(text.startsWith('A source'))block.text='正文只在自己的原区域内换行并统一缩小，不占用图片、图注和脚注的位置。'.repeat(35);
+       else if(text.startsWith('Figure 1'))block.text='图1：第一张合成图的说明，保持原区域居中。';
+       else if(text.startsWith('Figure 2'))block.text='图2：第二张合成图的说明，保持原区域居中。';
+       else if(text.startsWith('Synthetic footnote'))block.text='合成脚注固定在图注下方，不移动到其他位置。';
+      }
+      if(category==='fixedSymbols'&&block.prefix){
+       check(block.inline_math?.length===1,'list coordinate was not protected');
+       block.translation_text='纬度说明：这是合成列表内容，用来检查坐标与正文统一缩小。'.repeat(10)+'[['+block.inline_math[0].id+']]';
+      }
+      if(category==='prefixSymbols'&&block.prefix){
+       block.translation_text=block.translation_text
+        .replace('Plain synthetic list content is translated completely.','合成列表正文完整翻译，不移动项目符号。')
+        .replace('Repeated symbol in the body:','正文中的同形符号：').replace('Coordinate:','坐标：');
+       block.text=block.translation_text;
+      }
+     }
+    }
+    await active.saveResult(document,{document});
+    const files=await active.exportFile(document,undefined,{translated:true,bilingual:true,order},e=>exportProgress.push(e));
+    const layout=await IOUtils.readJSON(PathUtils.join(document.output_dir,'pdf-layout-report.json'));
+    const complete=layout.unplaced.length===0&&layout.output_pages===document.pages.length&&
+     layout.page_map.every((p,i)=>p.source_page===i+1&&p.output_page===i+1&&p.continuation_index===0)&&
+     exportProgress.length>0&&exportProgress.at(-1).done===exportProgress.at(-1).total;
+    const fixed=layout.placements.every(p=>p.fit==='fixed-region'&&p.scale>0&&p.scale<=1&&
+     Math.abs(p.font_size-p.source_font_size*p.scale)<.00001&&p.fixed_bbox.every((v,i)=>v===p.bbox[i])&&
+     p.ink_bbox[0]>=p.bbox[0]-.001&&p.ink_bbox[1]>=p.bbox[1]-.001&&
+     p.ink_bbox[2]<=p.bbox[2]+.001&&p.ink_bbox[3]<=p.bbox[3]+.001);
+    check(complete&&fixed&&layout.placements.length>0,'fixed PDF bridge layout failed: '+category);
+    if(real)check(parseProgress.length>0&&parseProgress.at(-1).done===parseProgress.at(-1).total,'parse progress incomplete');
+    report[category].push({...fixture,order,files,report:layout,complete,fixed,
+     document:PathUtils.join(document.output_dir,'translated.json')});await write();
+   }
+  }
+  if(cfg.layoutOnly){report.scope='layout bridge plus packaged real parser';report.result='PASS';return;}
   originalAlert=Services.prompt.alert;originalConfirm=Services.prompt.confirm;originalDialog=win.openDialog;
   Services.prompt.alert=(_w,title,message)=>report.alerts.push({title,message});
   Services.prompt.confirm=(_w,title,message)=>{report.confirmations.push({title,message});return false;};
@@ -99,7 +234,9 @@ async function verify(){
    ['searchable.pdf',false,true,'translated-left'],['rotated.pdf',true,true,'translated-left'],
    ['figure.png',true,true,'original-left'],['figure.png',false,true,'translated-left'],['figure.png',true,false,'original-left'],
    ['fit.pdf',true,true,'original-left'],['fit.pdf',true,false,'original-left'],
-   ['fit.pdf',false,true,'translated-left'],['fit-rotated.pdf',true,true,'translated-left']];
+   ['fit.pdf',false,true,'translated-left'],['fit-rotated.pdf',true,true,'translated-left'],
+   ['toc.pdf',true,true,'original-left'],['toc-rotated.pdf',true,true,'translated-left'],
+   ['ocr-label.pdf',true,true,'original-left'],['ocr-label-rotated.pdf',true,true,'translated-left']];
   for(const [name,translated,bilingual,order] of cases){
    report.stage=name+':'+translated+':'+bilingual+':'+order;await write();
    api.saveOutput({translated,bilingual,order});
@@ -167,6 +304,7 @@ async function verify(){
    const status=message.dialog.document.getElementById('translation-status').textContent;
    const restored=await IOUtils.read(sourcePath);
    check(sourceBytes.length===restored.length&&sourceBytes.every((b,i)=>b===restored[i]),'reliability source changed');
+    report.reliabilityDiagnostic={model,requests:counts[model],outputs:outputIDs.length,status};await write();
    let expectedAlert;
    if(model==='fixture-retry'||model==='fixture-timeout-retry'){
     check(counts[model]===6&&outputIDs.length===1,'fifth retry did not recover exactly once');

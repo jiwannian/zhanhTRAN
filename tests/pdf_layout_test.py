@@ -95,13 +95,13 @@ class PDFLayoutTests(unittest.TestCase):
         result = self.render()
         with fitz.open(result["translated"]) as pdf:
             self.assertIn("\u4fdd\u6301\u51c6\u786e", pdf[0].get_text())
-            self.assertTrue(pdf[0].get_images())
+            self.assertTrue(pdf[0].get_xobjects())
         self.assertEqual(len([x for x in result["report"]["placements"] if x["ids"] == [block["id"]]]), 1)
 
     def test_tall_inline_fraction_does_not_overlap_the_following_line(self):
         with fitz.open(self.source) as original, fitz.open(self.source) as pdf:
             page = pdf[0]
-            item = {"ids": ["fraction"], "rect": fitz.Rect(30, 320, 180, 440),
+            item = {"ids": ["fraction"], "rect": fitz.Rect(30, 320, 180, 480),
                     "text": "\u4e2d\u6587" * 8 + " [[M0]] " + "\u4e2d\u6587" * 20,
                     "size": 11, "bold": False, "image": False,
                     "inline_math": [{"id": "M0", "bbox": [220, 225, 260, 245]}]}
@@ -203,22 +203,25 @@ class PDFLayoutTests(unittest.TestCase):
         self.document = {"schema": 1, "source_sha256": hashlib.sha256(self.source.read_bytes()).hexdigest(),
             "pages": [{"number": 1, "width": 400, "height": 500, "blocks": [block]}],
             "translated_pages": [{"number": 1, "width": 400, "height": 500, "blocks": [translated]}]}
-        result = self.render()
-        self.assertLess(result["report"]["placements"][0]["font_size"], 5)
-        with fitz.open(self.source) as original, fitz.open(result["translated"]) as pdf:
-            self.assertIn("\u5982\u679c", pdf[0].get_text())
-            self.assertIn("E = mc2", pdf[0].get_text())
-            clip = fitz.Rect(39, 40, 100, 55)
-            self.assertEqual(original[0].get_pixmap(clip=clip).samples, pdf[0].get_pixmap(clip=clip).samples)
+        result=self.render()
+        from tests.fixed_layout_test import check_fixed
+        check_fixed(self,self.source,self.document,result)
+        with fitz.open(result['translated']) as pdf:
+            self.assertIn('E = mc2',pdf[0].get_text())
+        self.assertLess(result['report']['placements'][0]['scale'],1)
 
-    def test_long_native_run_still_rejects_unreadable_overflow(self):
-        before = self.document["pages"][0]["blocks"][0]
-        after = self.document["translated_pages"][0]["blocks"][0]
-        before["layout_runs"] = [{"text": "Research results", "bbox": [30, 35, 36, 45]}]
-        after["layout_runs"] = [{"text": "\u5b57" * 1000, "bbox": [30, 35, 36, 45]}]
-        with self.assertRaisesRegex(ValueError, "PDF_TEXT_DOES_NOT_FIT"):
-            self.render()
-        self.assertFalse(list((self.root / "output").glob("*.pdf")))
+    def test_long_native_run_shrinks_below_half_without_text_loss(self):
+        before=self.document['pages'][0]['blocks'][0]
+        after=self.document['translated_pages'][0]['blocks'][0]
+        before['layout_runs']=[{'text':'Research results','bbox':before['bbox']}]
+        after['layout_runs']=[{'text':'字'*1000,'bbox':before['bbox']}]
+        result=self.render()
+        from tests.fixed_layout_test import check_fixed
+        check_fixed(self,self.source,self.document,result)
+        p=next(p for p in result['report']['placements'] if p['ids']==[before['id']+'-run0'])
+        self.assertLess(p['scale'],.5)
+        with fitz.open(result['translated']) as pdf:
+            self.assertEqual(pdf[0].get_text().count('字'),1000)
 
     def test_expanded_short_native_run_stays_inside_its_source_bounds(self):
         self.source = self.root / "short-run.pdf"
@@ -237,12 +240,12 @@ class PDFLayoutTests(unittest.TestCase):
         self.document = {"schema": 1, "source_sha256": hashlib.sha256(self.source.read_bytes()).hexdigest(),
             "pages": [{"number": 1, "width": 400, "height": 500, "blocks": [block]}],
             "translated_pages": [{"number": 1, "width": 400, "height": 500, "blocks": [translated]}]}
-        result = self.render()
-        self.assertLess(result["report"]["placements"][0]["font_size"], 5)
-        with fitz.open(self.source) as original, fitz.open(result["translated"]) as pdf:
-            self.assertIn(text, pdf[0].get_text())
-            clip = fitz.Rect(63, 40, 110, 55)
-            self.assertEqual(original[0].get_pixmap(clip=clip).samples, pdf[0].get_pixmap(clip=clip).samples)
+        result=self.render()
+        from tests.fixed_layout_test import check_fixed
+        check_fixed(self,self.source,self.document,result)
+        with fitz.open(result['translated']) as pdf:
+            self.assertIn('E = mc2',pdf[0].get_text())
+        self.assertLess(result['report']['placements'][0]['scale'],1)
 
     def test_bad_geometry_and_output_overwrite_are_rejected(self):
         doc = copy.deepcopy(self.document)
@@ -293,11 +296,13 @@ class PDFLayoutTests(unittest.TestCase):
             self.render()
         self.assertFalse(list((self.root / "output").glob("*.pdf")))
 
-    def test_unfittable_translation_does_not_publish_a_truncated_pdf(self):
-        self.document["translated_pages"][0]["blocks"][0]["text"] = "\u5b57" * 30000
-        with self.assertRaisesRegex(ValueError, "PDF_TEXT_DOES_NOT_FIT"):
-            self.render()
-        self.assertFalse(list((self.root / "output").glob("*.pdf")))
+    def test_body_overflow_shrinks_inside_original_region(self):
+        self.document['translated_pages'][0]['blocks'][1]['text']='完整的长译文。'*300
+        result=self.render()
+        from tests.fixed_layout_test import check_fixed
+        check_fixed(self,self.source,self.document,result)
+        with fitz.open(result['translated']) as pdf:
+            self.assertEqual(renderer.normalize(pdf[0].get_text()).count('完整的长译文。'),300)
 
     def test_failure_report_records_safe_error_code_and_page(self):
         self.document["pages"][0]["blocks"][1]["bbox"] = list(self.document["pages"][0]["blocks"][0]["bbox"])

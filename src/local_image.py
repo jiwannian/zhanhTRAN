@@ -38,8 +38,10 @@ def render_frame(image, before, after, number, report):
         page.insert_image(page.rect, stream=stream.getvalue())
         with fitz.open(stream=original.tobytes(), filetype='pdf') as translated:
             units = layout.page_units(page, before, after, report)
-            # Raster pages have no native font spans; infer size from the OCR line height.
-            units = [{**item, 'size': max(6, min(48, item['rect'].height * .72))} for item in units]
+            # OCR units already use their cached/inferred source line size.
+            units = [{**item, 'size': max(6, min(48, item['rect'].height * .72))}
+                     if not item.get('ocr_bounds') else item for item in units]
+            start = len(report['placements'])
             layout.place_page(translated[0], page, units, number, report)
             if report['unplaced']:
                 raise ValueError('IMAGE_TRANSLATION_INCOMPLETE')
@@ -49,8 +51,8 @@ def render_frame(image, before, after, number, report):
                 raise ValueError('IMAGE_LAYOUT_INVALID')
             # Preserve exact source colors/alpha outside translated text rectangles.
             result = image.copy()
-            for item in units:
-                rect = item['rect'].irect
+            for placed in report['placements'][start:]:
+                rect = fitz.Rect(placed['bbox']).irect
                 box = (rect.x0, rect.y0, rect.x1, rect.y1)
                 result.paste(rendered.crop(box).convert('RGBA'), box)
             return result
@@ -85,7 +87,7 @@ def save_frames(path, frames, fmt, info, durations):
                 raise ValueError('IMAGE_OUTPUT_INVALID')
 
 
-def export_images(source, document, output_dir, outputs=('translated', 'bilingual'), order='original-left'):
+def export_images(source, document, output_dir, outputs=('translated', 'bilingual'), order='original-left', on_progress=None):
     outputs = layout.selected_outputs(outputs, order)
     source = Path(source).resolve(strict=True)
     extension = source.suffix[1:].lower()
@@ -93,6 +95,7 @@ def export_images(source, document, output_dir, outputs=('translated', 'bilingua
     if not fmt:
         raise ValueError('IMAGE_FORMAT_INVALID')
     layout.validate_document(source, document)
+    layout.prepare_fonts(document)
     folder = Path(output_dir).resolve()
     if folder == source or source in folder.parents:
         raise ValueError('IMAGE_OUTPUT_INVALID')
@@ -131,6 +134,8 @@ def export_images(source, document, output_dir, outputs=('translated', 'bilingua
                     pair.paste(second, (frame.width, 0))
                     bilingual.append(pair)
                 durations.append(image.info.get('duration', 100))
+                if on_progress:
+                    on_progress(n+1,len(document['pages']))
         for kind, frames in [('translated', translated), ('bilingual', bilingual)]:
             if kind in outputs:
                 save_frames(temps[kind], frames, fmt, info, durations)
@@ -162,12 +167,14 @@ def main():
     cli.add_argument('--output', required=True)
     cli.add_argument('--outputs', default='translated,bilingual')
     cli.add_argument('--order', default='original-left', choices=['original-left', 'translated-left'])
+    cli.add_argument('--progress', action='store_true')
     args = cli.parse_args()
     try:
         path = Path(args.document)
         if path.stat().st_size > 64*1024*1024:
             raise ValueError('IMAGE_DOCUMENT_TOO_LARGE')
-        result = export_images(args.input, json.loads(path.read_text('utf-8')), args.output, args.outputs.split(','), args.order)
+        callback = (lambda done,total: print('ZHANHTRAN_PROGRESS '+json.dumps({'stage':'export','done':done,'total':total}), file=sys.stderr, flush=True)) if args.progress else None
+        result = export_images(args.input, json.loads(path.read_text('utf-8')), args.output, args.outputs.split(','), args.order, callback)
         print(json.dumps({'ok': True, **{k: v for k, v in result.items() if k != 'report'}}))
         return 0
     except Exception as error:

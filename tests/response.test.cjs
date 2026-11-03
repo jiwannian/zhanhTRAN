@@ -163,7 +163,7 @@ test('timeout retries remain bounded and cancellation interrupts an already sche
 test('structured retries repeat only the interrupted batch and retain ordered progress',async()=>{
  const doc={schema:1,pages:[{number:1,blocks:Array.from({length:90},(_,i)=>({id:'b'+i,type:'paragraph',text:'Hello '+i}))}]};
  const requests=[],progress=[];
- const result=await C.translateDocument(C.DEFAULT,'fixture-key',doc,{retryAttempts:2,retryDelayMs:1,
+ const result=await C.translateDocument(C.DEFAULT,'fixture-key',doc,{retryAttempts:2,retryDelayMs:1,concurrency:1,
   onProgress:(n,total)=>progress.push([n,total]),fetch:async(url,options)=>{
    const units=JSON.parse(JSON.parse(options.body).messages[1].content);requests.push(units.map(x=>x.id));
    if(requests.length===2)return new Response('{}',{status:503});

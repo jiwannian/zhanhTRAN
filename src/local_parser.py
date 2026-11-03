@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 import re
 import unicodedata
+import copy
 
 import numpy as np
 import pymupdf as fitz
@@ -16,6 +17,355 @@ from PIL import Image
 fitz.no_recommend_layout()
 Image.MAX_IMAGE_PIXELS = 25_000_000
 _OCR = None
+_IMAGE_CACHE = {}
+
+
+class PageAnalysis:
+    """One text extraction and one lazy geometry scan per page, shared by regions."""
+    def __init__(self, page):
+        self.page = page
+        self.native = page.get_text('dict')
+        self.raw = None
+        self.clips = {}
+        self.drawings = self.trace = self.tables = None
+
+    def __getattr__(self, name):
+        return getattr(self.page, name)
+
+    def get_text(self, kind, clip=None, **options):
+        if kind not in ('dict', 'rawdict') or options:
+            return self.page.get_text(kind, clip=clip, **options)
+        if kind == 'dict' and clip is None:
+            return self.native
+        if self.raw is None:
+            self.raw = self.page.get_text('rawdict', flags=fitz.TEXTFLAGS_RAWDICT & ~fitz.TEXT_PRESERVE_IMAGES)
+        rect = fitz.Rect(clip) if clip is not None else self.rect
+        key = tuple(rect)
+        cached = self.clips.get((kind, key))
+        if cached is not None:
+            return cached
+        if kind == 'dict':
+            raw = self.get_text('rawdict', clip=rect)
+            blocks = []
+            for block in raw['blocks']:
+                lines = []
+                for line in block['lines']:
+                    spans = [{**span, 'text': ''.join(char['c'] for char in span['chars'])}
+                             for span in line['spans']]
+                    for span in spans:
+                        span.pop('chars', None)
+                    lines.append({**line, 'spans': spans})
+                blocks.append({**block, 'lines': lines})
+            result = {'blocks': blocks}
+            self.clips[(kind, key)] = result
+            return result
+        x0, y0, x1, y1 = key
+        blocks = []
+        for block in self.raw['blocks']:
+            bx0, by0, bx1, by1 = block['bbox']
+            if block['type'] != 0 or bx0 >= x1 or bx1 <= x0 or by0 >= y1 or by1 <= y0:
+                continue
+            lines = []
+            for line in block['lines']:
+                lx0, ly0, lx1, ly1 = line['bbox']
+                if lx0 >= x1 or lx1 <= x0 or ly0 >= y1 or ly1 <= y0:
+                    continue
+                spans = []
+                for span in line['spans']:
+                    sx0, sy0, sx1, sy1 = span.get('bbox', line['bbox'])
+                    if sx0 >= x1 or sx1 <= x0 or sy0 >= y1 or sy1 <= y0:
+                        continue
+                    chars = [c for c in span['chars'] if x0 <= (c['bbox'][0]+c['bbox'][2])/2 <= x1
+                             and y0 <= (c['bbox'][1]+c['bbox'][3])/2 <= y1]
+                    if not chars:
+                        continue
+                    box = [min(c['bbox'][0] for c in chars), min(c['bbox'][1] for c in chars),
+                           max(c['bbox'][2] for c in chars), max(c['bbox'][3] for c in chars)]
+                    spans.append({**span, 'bbox': box, 'chars': chars})
+                if spans:
+                    box = [min(s['bbox'][0] for s in spans), min(s['bbox'][1] for s in spans),
+                           max(s['bbox'][2] for s in spans), max(s['bbox'][3] for s in spans)]
+                    lines.append({**line, 'bbox': list(box), 'spans': spans})
+            if lines:
+                blocks.append({**block, 'lines': lines})
+        result = {'blocks': blocks}
+        self.clips[(kind, key)] = result
+        return result
+
+    def get_drawings(self):
+        if self.drawings is None:
+            self.drawings = self.page.get_drawings() if hasattr(self.page, 'get_drawings') else []
+        return self.drawings
+
+    def get_texttrace(self):
+        if self.trace is None:
+            self.trace = self.page.get_texttrace() if hasattr(self.page, 'get_texttrace') else []
+        return self.trace
+
+    def find_tables(self):
+        if self.tables is None:
+            self.tables = self.page.find_tables(paths=self.get_drawings()) if isinstance(self.page, fitz.Page) else self.page.find_tables()
+        return self.tables
+
+
+def native_row_span(line):
+    return max(line['spans'],key=lambda s:sum(bool(c['c'].strip()) for c in s['chars']))
+
+
+def native_row_baseline(line):
+    # Glyph bboxes rise for accents/superscripts and vary by font. Their top
+    # edge is not the line pitch. Ignore blank/raised leading spans.
+    span = native_row_span(line)
+    return span.get('origin',(0,line['bbox'][3]-span['size']*.3))[1]
+
+
+def native_text_rows(page, box):
+    """Visible horizontal rows shared by metadata and definition detection."""
+    raw = page.get_text('rawdict', clip=fitz.Rect(box) + (-.1, -.1, .1, .1))
+    lines = [line for b in raw['blocks'] if b['type'] == 0 for line in b['lines']]
+    rows = []
+    for line in lines:
+        # PDF generators often leave a displaced whitespace-only text run. It
+        # has a real bbox but is not a paragraph line, font or indent anchor.
+        if not any(c['c'].strip() for s in line['spans'] for c in s['chars']):
+            continue
+        # Trim whitespace geometry, including spaces embedded in a visible
+        # span. Displaced blank runs are not layout anchors or usable space.
+        visible = [c for s in line['spans'] for c in s['chars'] if c['c'].strip()]
+        line = {**line, 'bbox': [min(c['bbox'][0] for c in visible), min(c['bbox'][1] for c in visible),
+                                max(c['bbox'][2] for c in visible), max(c['bbox'][3] for c in visible)]}
+        # A number and its text can be separate extraction lines with a tiny
+        # baseline offset (different fonts). Rejoin that visual row before
+        # finding its marker/body gutter, not by exact rounded y equality.
+        row = next((r for r in reversed(rows)
+                    if tuple(r.get('dir',(1,0)))==tuple(line.get('dir',(1,0)))
+                    and abs(native_row_baseline(r)-native_row_baseline(line))<=
+                        min(native_row_span(r)['size'],native_row_span(line)['size'])*.12),None)
+        if row is not None:
+            row['spans'].extend(line['spans'])
+            row['spans'].sort(key=lambda s:s['bbox'][0])
+            row['bbox'] = list(fitz.Rect(row['bbox']) | fitz.Rect(line['bbox']))
+        else:
+            rows.append({**line,'spans':list(line['spans'])})
+    return sorted(rows,key=lambda line:(native_row_baseline(line),line['bbox'][0]))
+
+
+def native_metadata(page, block):
+    if block.get('definition'):
+        row = block['definition']
+        bounds = fitz.Rect(block['bbox'])+(-.1,-.1,.1,.1)
+        if (not bounds.contains(fitz.Rect(row['label_bbox'])) or not bounds.contains(fitz.Rect(row['body_bbox']))
+                or fitz.Rect(row['label_bbox']).x1>=fitz.Rect(row['body_bbox']).x0
+                or not block.get('text','').startswith(row['label']+'\n')):
+            raise ValueError('PDF_LAYOUT_INVALID')
+        def value(box):
+            return ''.join(c['c'] for line in native_text_rows(page,box) for span in line['spans'] for c in span['chars'])
+        if (re.sub(r'\s+','',value(row['label_bbox']))!=re.sub(r'\s+','',row['label'])
+                or re.sub(r'\s+','',value(row['body_bbox']))!=re.sub(r'\s+','',block['text'].split('\n',1)[1])):
+            raise ValueError('PDF_LAYOUT_INVALID')
+        result = native_metadata(page,{'bbox':row['body_bbox']})
+        result.update(prefix={'text':row['label'],'bbox':row['label_bbox'],'kind':'definition'},
+                      translation_text=block['text'].split('\n',1)[1],flow_blocked=True)
+        return result
+    lines = native_text_rows(page,block['bbox'])
+    spans = [s for line in lines for s in line['spans'] if any(c['c'].strip() for c in s['chars'])]
+    if not spans:
+        return {}
+    weighted = sorted((s['size'], len(s['chars'])) for s in spans)
+    count = sum(n for _, n in weighted)
+    running = 0
+    size = weighted[-1][0]
+    for value, n in weighted:
+        running += n
+        if running >= count/2:
+            size = value
+            break
+    main = max(spans, key=lambda s: len(s['chars']))
+    def bold(s):
+        return bool(s.get('flags', 0) & 16 or re.search(r'bold|-b', s['font'], re.I))
+    def italic(s):
+        return bool(s.get('flags', 0) & 2 or re.search(r'italic|-i$|-bi$', s['font'], re.I))
+    baselines = [native_row_baseline(line) for line in lines]
+    leading = [b-a for a,b in zip(baselines, baselines[1:]) if size*.8 < b-a < size*3]
+    style = {'size': size, 'bold': sum(len(s['chars']) for s in spans if bold(s)) > count/2,
+             'italic': sum(len(s['chars']) for s in spans if italic(s)) > count/2,
+             'family': 'serif' if main.get('flags', 0) & 4 else 'sans-serif',
+             'line_height': float(np.median(leading))/size if leading else 1.35}
+    rows = []
+    for line in lines:
+        chars = [c for s in line['spans'] for c in s['chars']]
+        text = ''.join(c['c'] for c in chars)
+        match = re.match(r'^(?P<label>.*?)(?P<dots>[.\u2026\u00b7]{3,}\s*)(?P<page>\d+|[ivxlcdm]+)\s*$', text, re.I)
+        if not match:
+            continue
+        label = match.group('label')
+        prefix = re.match(r'^\s*\d+(?:\.\d+)*\.?\s*', label)
+        start = prefix.end() if prefix else len(label)-len(label.lstrip())
+        end = len(label.rstrip())
+        if start >= end:
+            continue
+        def box(a, b):
+            result = fitz.Rect(chars[a]['bbox'])
+            for char in chars[a+1:b]:
+                result |= fitz.Rect(char['bbox'])
+            return list(result)
+        rows.append({'text': label[start:end], 'bbox': list(line['bbox']), 'title_bbox': box(start,end),
+                     'number': label[:start].strip(), 'number_bbox': box(0,start) if start else None,
+                     'page_text': match.group('page'), 'page_bbox': box(*match.span('page')),
+                     'leader_bbox': box(*match.span('dots')), 'style': style, 'baseline': chars[-1]['origin'][1]})
+    if rows and len(rows) == len(lines):
+        return {'style': style, 'toc_rows': rows, 'source_lines': [list(line['bbox']) for line in lines]}
+    first_chars = [c for s in lines[0]['spans'] for c in s['chars']]
+    first_text = ''.join(c['c'] for c in first_chars)
+    prefix = re.match(r'^\s*(?:[\u2022\u25aa\u25ab\u25a0\u25a1\u25e6\uf0a7\uf0b7\-\u2013\u2014]|\([a-zA-Z0-9]+\)|[a-zA-Z][.)])\s*', first_text)
+    numbered = False
+    if prefix is None:
+        candidate = re.match(r'^\s*\d{1,4}[.)]?\s*',first_text)
+        if candidate and candidate.end()<len(first_chars) and first_text[candidate.end():].strip():
+            label_end = len(candidate.group().rstrip())
+            body = next((c for c in first_chars[candidate.end():] if c['c'].strip()),None)
+            gap = body['bbox'][0]-first_chars[label_end-1]['bbox'][2] if body else 0
+            # Bare numbers need a physical marker gutter. A normal word-space
+            # after a year/count, a time or a decimal is not a list prefix.
+            punctuated = candidate.group().rstrip().endswith(('.',')'))
+            if body and (gap>=size*.6 or (punctuated and gap>=size*.18)) \
+                    and first_text[candidate.end()] not in '.:0123456789':
+                prefix,numbered = candidate,True
+    if prefix and not first_text[prefix.end():].strip():
+        # A wrapped final label such as "C." is content, not an empty list.
+        prefix = None
+    if prefix and prefix.end()<len(first_chars) and not prefix.group()[-1].isspace():
+        if first_chars[prefix.end()]['bbox'][0]-first_chars[prefix.end()-1]['bbox'][2] < size*.4:
+            prefix = None
+    result = {'style': style, 'source_lines': [list(line['bbox']) for line in lines],
+              'source_baselines':baselines,'source_baseline': baselines[0], 'alignment': 'left'}
+    word = re.search(r'\S+',first_text[prefix.end():] if prefix else first_text)
+    if word:
+        start,end = word.span()
+        if prefix:
+            start,end = start+prefix.end(),end+prefix.end()
+        # CJK can wrap between characters; an English word is indivisible.
+        if re.match(r'[\u2e80-\ua4cf\uac00-\ud7af\uf900-\ufaff]',first_chars[start]['c']):
+            end = start+1
+        result['source_first_word_width'] = max(c['bbox'][2] for c in first_chars[start:end])-first_chars[start]['bbox'][0]
+    if any(tuple(line.get('dir',(1,0)))!=(1,0) for line in lines) or any(
+            s.get('flags',0)&8 or re.search(r'courier|mono',s['font'],re.I) for s in spans):
+        result['flow_blocked'] = True
+    if prefix:
+        marker_chars = first_chars[:prefix.end()]
+        box = fitz.Rect(marker_chars[0]['bbox'])
+        for char in marker_chars[1:]:
+            box |= fitz.Rect(char['bbox'])
+        result['prefix'] = {'text': prefix.group().strip(), 'bbox': list(box)}
+        if numbered:
+            result['prefix']['kind'] = 'number'
+        result['translation_text'] = first_text[prefix.end():] + ''.join('\n'+''.join(c['c'] for s in line['spans'] for c in s['chars']) for line in lines[1:])
+        first_body = [c for c in first_chars[prefix.end():] if c['c'].strip()]
+        left = first_body[0]['bbox'][0] if first_body else box.x1
+        # The marker has its own fixed region and must never be redacted as
+        # part of the translated body.
+        lines[0] = {**lines[0], 'bbox': [left, lines[0]['bbox'][1], lines[0]['bbox'][2], lines[0]['bbox'][3]]}
+    else:
+        left = min(line['bbox'][0] for line in (lines[1:] or lines))
+    result['body_left'] = left
+    result['first_line_indent'] = lines[0]['bbox'][0]-left
+    result['source_lines'] = [list(line['bbox']) for line in lines]
+    result['fixed_bbox'] = [min(line['bbox'][0] for line in lines), min(line['bbox'][1] for line in lines),
+                            max(line['bbox'][2] for line in lines), max(line['bbox'][3] for line in lines)]
+    value = '\n'.join(''.join(c['c'] for s in line['spans'] for c in s['chars']) for line in lines).strip()
+    if re.match(r'^(?:fig(?:ure)?[. ]|table\s)\s*\d', value, re.I):
+        result['alignment'] = 'center'
+    elif re.fullmatch(r'(?:Page\s+)?\d+\s*(?:of\s+\d+)?', value, re.I):
+        result['alignment'] = 'right'
+    return result
+
+
+def protect_native_symbols(page, block, inline):
+    """Keep coordinate glyphs and private font encodings out of model/font conversion."""
+    raw = page.get_text('rawdict', clip=fitz.Rect(block['bbox']) + (-.1,-.1,.1,.1))
+    formulas = list(inline.get('inline_math', []))
+    rows = [[c for span in line['spans'] for c in span['chars']]
+            for native in raw['blocks'] if native['type'] == 0 for line in native['lines']]
+    text = inline.get('translation_text', block.get('translation_text',
+        '\n'.join(''.join(c['c'] for c in chars) for chars in rows)))
+    prefix = fitz.Rect(block['prefix']['bbox']) if block.get('prefix') else None
+    added = False
+    # U+201F is used as a single-prime glyph by some publisher fonts. Keep
+    # the complete coordinate, including spaces and split font spans, opaque.
+    prime = r"[\u2032\u2018\u2019\u201b\u201f\u02b9\u02bc']"
+    second = r"[\u0022\u2033\u201c\u201d\u201f\u02ba\u2032\u2018\u2019']{1,2}"
+    pattern = re.compile(r"\d{1,3}\s*[\u00b0\u00ba]\s*\d{1,2}\s*"+prime+
+                         r"(?:\s*\d{1,2}(?:[.,]\d+)?\s*"+second+r")?(?:\s*[NSEW](?![A-Za-z]))?|[\ue000-\uf8ff]+")
+    for chars in rows:
+        value = ''.join(c['c'] for c in chars)
+        for match in pattern.finditer(value):
+            rect = fitz.Rect(chars[match.start()]['bbox'])
+            for char in chars[match.start()+1:match.end()]:
+                rect |= fitz.Rect(char['bbox'])
+            # A list marker is already retained outside the body frame. It is
+            # not an inline reservation, even when the same PUA glyph appears
+            # again in the body. Only register a token after replacing text.
+            if (prefix is not None and (prefix+(-.1,-.1,.1,.1)).contains(rect)) or match.group() not in text:
+                continue
+            used = {token['id'] for token in formulas}
+            index = 0
+            while 'M'+str(index) in used:
+                index += 1
+            token = {'id': 'M'+str(index), 'bbox': list(rect), 'kind': 'symbol',
+                     'baseline': chars[match.start()]['origin'][1], 'text': match.group()}
+            text = text.replace(match.group(), '[['+token['id']+']]', 1)
+            formulas.append(token)
+            added = True
+    if not added:
+        return inline
+    return {'translation_text': text, 'inline_math': formulas}
+
+
+def native_text_styles(page, block):
+    """Keep mixed prose styles in one translation request, with paired markers.
+
+    Formula reservations already carry their original appearance. Only wrap
+    non-main prose runs still present in the continuous translation text.
+    """
+    text = block.get('translation_text', block.get('text', ''))
+    main = block.get('style', {})
+    styles, cursor = [], 0
+    raw = page.get_text('rawdict', clip=fitz.Rect(block['bbox'])+(-.1,-.1,.1,.1))
+    for native in raw['blocks']:
+        for line in native.get('lines', []):
+            for span in line['spans']:
+                value = ''.join(c['c'] for c in span['chars']).strip()
+                if not value or not re.search(r'[A-Za-z\u3400-\u9fff]{2}', value):
+                    continue
+                style = {'size': span['size'], 'bold': bool(span.get('flags', 0)&16 or re.search(r'bold|-b',span['font'],re.I)),
+                         'italic': bool(span.get('flags',0)&2 or re.search(r'italic|-i$|-bi$',span['font'],re.I)),
+                         'family': 'serif' if span.get('flags',0)&4 else 'sans-serif'}
+                match = re.search(re.escape(value).replace(r'\ ',r'\s+'), text[cursor:])
+                if not match:
+                    continue
+                a, b = cursor+match.start(), cursor+match.end()
+                cursor = b
+                if (abs(style['size']-main.get('size',style['size']))<.01
+                        and all(style[k]==main.get(k,False if k!='family' else 'serif') for k in ('bold','italic','family'))):
+                    continue
+                name = 'S'+str(len(styles))
+                styles.append({'id': name, **style})
+                opening, closing = '[['+name+']]', '[[/'+name+']]'
+                text = text[:a]+opening+text[a:b]+closing+text[b:]
+                cursor += len(opening)+len(closing)
+    return {'translation_text':text,'text_styles':styles} if styles else {}
+
+
+def native_cell_content(page, cell, text):
+    block = {'bbox':cell,'text':text,**native_metadata(page,{'bbox':cell})}
+    # Cell topology, not paragraph whitespace, supplies its fixed rectangle.
+    # A cell list marker is kept native by the PDF renderer as a separate box.
+    block.update(protect_native_symbols(page,block,{}))
+    block.update(native_text_styles(page,block))
+    if not block.get('inline_math') and not block.get('text_styles'):
+        return None
+    return {key:block[key] for key in ('translation_text','inline_math','text_styles','source_baseline','alignment',
+                                      'prefix','body_left','first_line_indent') if key in block}
 
 
 def native_inline_math(page, box, kind):
@@ -33,7 +383,9 @@ def native_inline_math(page, box, kind):
     rows, characters = [], []
     for span in spans:
         value = "".join(c["c"] for c in span["chars"]).strip()
-        math = bool(re.search(r"math|sym|AdvPS", span["font"], re.I)) or span["size"] < size * .85 or (
+        reference = max(spans,key=lambda s:len(s['chars']))
+        shifted = abs(span.get('origin',(0,0))[1]-reference.get('origin',(0,0))[1]) > size*.15
+        math = bool(re.search(r"math|sym|AdvPS", span["font"], re.I)) or (span["size"] < size * .85 and (shifted or not re.search(r'[A-Za-z]{3}', value))) or (
             bool(span.get("flags", 0) & 2 or re.search(r"-i$|-bi$", span["font"], re.I))
             and bool(re.fullmatch(r"[A-Za-z]{1,2}", value)) and value.lower() not in connectors)
         characters.extend({**char, "math": math} for char in span["chars"])
@@ -109,7 +461,9 @@ def native_layout_runs(page, box, kind):
     connectors = {"if", "of", "in", "on", "as", "by", "to", "is", "it", "we", "be", "an", "do", "or", "no"}
     italic_variables = [s for line in lines for s in line["spans"] if re.search(r"-i$|-bi$", s["font"], re.I)
                         and re.fullmatch(r"[A-Za-z]{1,2}", s["text"].strip()) and s["text"].strip().lower() not in connectors]
-    equation = (len(text)<160 and re.search(r"\bif\b", text) and re.search(r"\d|[()=]|\n", text)) or (
+    # Dates, counts, parentheses and wrapped lines occur in ordinary conditional
+    # prose. They do not justify splitting it into fixed equation-label boxes.
+    equation = (len(text)<160 and re.search(r"\bif\b", text) and re.search(r"[=<>\u2264\u2265\u2260\u2248\u2208\u2209]", text)) or (
         math_spans or italic_variables)
     if not (algorithm or equation):
         return []
@@ -258,6 +612,221 @@ def coalesce_native_blocks(page, blocks):
     return reading_order(other + result)
 
 
+def native_definition_blocks(page, blocks):
+    """Recognise repeated unruled acronym/definition columns before prose flow.
+
+    A physical gutter and repeated aligned key/value rows are required;
+    case, spaces and terminal dots are not reliable abbreviation boundaries.
+    An acronym in normal prose is not a definition list. Consume only fully
+    covered source blocks so detection cannot erase unrelated source content.
+    The native key is retained as a prefix and only the definition is sent to
+    translation. Rows remain separate even if their right edges are ragged.
+    """
+    eligible = [b for b in blocks if b.get('type') in ('paragraph','heading','footnote')
+                and b.get('extraction','pymupdf')=='pymupdf'
+                and not any(b.get(k) for k in ('definition','toc_rows','layout_runs'))]
+    if not eligible:
+        return list(blocks)
+    rows = native_text_rows(page,page.rect)
+    def chars(line):
+        return [c for s in line['spans'] for c in s['chars']]
+    def box(values):
+        return [min(c['bbox'][0] for c in values),min(c['bbox'][1] for c in values),
+                max(c['bbox'][2] for c in values),max(c['bbox'][3] for c in values)]
+    def owners(values):
+        return [b for b in eligible if any(inside(c['bbox'],b['bbox']) for c in values)]
+    def covered(values, regions):
+        return all(any(inside(c['bbox'],r) for r in regions) for c in values if c['c'].strip())
+    known = [b['bbox'] for b in blocks if b.get('definition')]
+    def label_text(values,size):
+        text,previous = '',None
+        for char in values:
+            # Some writers encode a key's word spaces only as positioning
+            # between text runs. Keep them in the key, never in the value.
+            if (previous and previous['c'].strip() and char['c'].strip()
+                    and char['bbox'][0]-previous['bbox'][2]>size*.18):
+                text += ' '
+            text += char['c'];previous = char
+        return re.sub(r'\s+',' ',text).strip()
+    candidates = []
+    for index,line in enumerate(rows):
+        if tuple(line.get('dir',(1,0)))!=(1,0):
+            continue
+        all_chars = chars(line)
+        visible = [(i,c) for i,c in enumerate(all_chars) if c['c'].strip()]
+        size = native_row_span(line)['size']
+        # A long key (MoCTCA) leaves less than two em before the established
+        # value column. Consider all real gutters, then require repeated
+        # column alignment; a key's internal spaces are not the first gutter.
+        for gap in range(1,len(visible)):
+            width = visible[gap][1]['bbox'][0]-visible[gap-1][1]['bbox'][2]
+            if width<size*.6:
+                continue
+            key = [c for _,c in visible[:gap]]
+            label = label_text(all_chars[visible[0][0]:visible[gap-1][0]+1],size)
+            if not (1<=len(re.sub(r'\s+','',label))<=24 and len(label.split())<=4
+                    and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9 .()/+&%_-]*',label)
+                    and re.search(r'[A-Za-z]',label)):
+                continue
+            body = all_chars[visible[gap][0]:]
+            if (body[0]['bbox'][0]-key[0]['bbox'][0]<size*2.5
+                    or not re.search(r'[A-Za-z\u3400-\u9fff]{2}', ''.join(c['c'] for c in body))):
+                continue
+            source = owners(key+body)
+            if not covered(key+body,[b['bbox'] for b in source]+known):
+                continue
+            candidates.append({'index':index,'label':label,'label_bbox':box(key),'body_bbox':box(body),
+                               'lines':[line],'key_chars':key,'body_chars':[body],
+                               'size':size,'owners':source,'gutter':width})
+    selected = {}
+    for row in candidates:
+        peers = {other['index'] for other in candidates if other['index']!=row['index']
+                 and abs(other['label_bbox'][0]-row['label_bbox'][0])<=row['size']*.2
+                 and abs(other['body_bbox'][0]-row['body_bbox'][0])<=row['size']*.5
+                 and abs(other['size']-row['size'])<.05
+                 and row['size']*.8<=abs(native_row_baseline(other['lines'][0])-
+                                           native_row_baseline(row['lines'][0]))<=row['size']*4}
+        if peers and covered(row['key_chars']+[c for values in row['body_chars'] for c in values],
+                             [b['bbox'] for b in row['owners']]):
+            # Existing correctly parsed rows still anchor old-cache upgrades,
+            # but must not be replaced or counted twice. Pick one split only.
+            rank = (len(peers),row['gutter'])
+            old = selected.get(row['index'])
+            if old is None or rank>old[0]:
+                selected[row['index']] = (rank,row)
+    accepted = [value[1] for _,value in sorted(selected.items())]
+    for row in accepted:
+        # Definitions may have source-wrapped continuation lines under the
+        # value column. Never include the next native key or another column.
+        previous = row['lines'][0]
+        for line in rows[row['index']+1:]:
+            distance = native_row_baseline(line)-native_row_baseline(previous)
+            values = chars(line)
+            if not (row['size']*.8<=distance<=row['size']*2.05
+                    and abs(line['bbox'][0]-row['body_bbox'][0])<=row['size']*.2
+                    and tuple(line.get('dir',(1,0)))==(1,0)
+                    and abs(native_row_span(line)['size']-row['size'])<.05
+                    and covered(values,[b['bbox'] for b in eligible])):
+                break
+            row['lines'].append(line);row['body_chars'].append(values)
+            row['body_bbox'] = list(fitz.Rect(row['body_bbox']) | fitz.Rect(box(values)))
+            row['owners'] += [b for b in owners(values) if all(b is not old for old in row['owners'])]
+            previous = line
+    # A partly covered native block is not disposable. Remove its candidate
+    # rows as well, rather than swallowing a heading or unrecognised text.
+    while accepted:
+        affected = [b for b in eligible if any(any(b is old for old in r['owners']) for r in accepted)]
+        bad = [b for b in affected if not covered(
+            [c for line in native_text_rows(page,b['bbox']) for c in chars(line)],
+            [r['label_bbox'] for r in accepted]+[r['body_bbox'] for r in accepted])]
+        if not bad:
+            break
+        accepted = [r for r in accepted if not any(any(b is old for old in r['owners']) for b in bad)]
+    consumed = [b for r in accepted for b in r['owners']]
+    result = [b for b in blocks if all(b is not old for old in consumed)]
+    for index,row in enumerate(accepted):
+        body_text = '\n'.join(''.join(c['c'] for c in line).strip() for line in row['body_chars'])
+        bounds = list(fitz.Rect(row['label_bbox']) | fitz.Rect(row['body_bbox']))
+        source_ids = [b['id'] for b in row['owners'] if 'id' in b]
+        body_owners = owners([c for line in row['body_chars'] for c in line])
+        definition = {'label':row['label'],'label_bbox':row['label_bbox'],'body_bbox':row['body_bbox'],
+                      'source_ids':source_ids,'body_source_ids':[b['id'] for b in body_owners if 'id' in b]}
+        block = {'type':'paragraph','text':row['label']+'\n'+body_text,'bbox':bounds,
+                 'extraction':'pymupdf','definition':definition}
+        if source_ids:
+            block['id'] = source_ids[0]+'-def'+str(index)
+        result.append(block)
+    return reading_order(result)
+
+
+def native_paragraph_groups(blocks):
+    """Join soft-wrapped prose, not every PDF block or sentence boundary.
+
+    Some writers emit each visual line as a separate block. A continuation
+    must follow a full line at the source column edge, with matching body
+    style, indentation and baseline pitch. A list item may own continuation
+    lines, but a new marker always starts another group. Blank lines, short
+    final lines, captions, columns and intervening artwork remain boundaries.
+    The resulting rectangle is only the union of these source text lines.
+    """
+    ordered = reading_order(blocks)
+    def eligible(b):
+        text = b.get('text','').strip()
+        return (b.get('type')=='paragraph' and b.get('extraction','pymupdf')=='pymupdf'
+                and b.get('source_lines') and b.get('style',{}).get('size',0)>0
+                and b.get('alignment','left') in ('left','justify')
+                and not any(b.get(k) for k in ('toc_rows','layout_runs','flow_blocked'))
+                and (b.get('prefix') or not re.match(r'^(?:\d+[.)]|\d+(?:\.\d+)+\.?)\s+\S',text))
+                and not re.match(r'^(?:fig(?:ure)?[. ]|table\s)\s*\d',text,re.I)
+                and not (re.search(r'[=\u222b\u2211\u221a]',text)
+                         and len(re.findall(r'[A-Za-z]{3,}',text))<8))
+    candidates = [b for b in ordered if eligible(b)]
+    def same_style(a,b):
+        sa,sb = a['style'],b['style']
+        return (abs(sa['size']-sb['size'])<.05
+                and all(sa.get(k,d)==sb.get(k,d) for k,d in
+                        (('bold',False),('italic',False),('family','serif'))))
+    def step(a,b):
+        return (b.get('source_baselines') or [line[1] for line in b['source_lines']])[0]-(
+            a.get('source_baselines') or [line[1] for line in a['source_lines']])[-1]
+    groups = []
+    for b in ordered:
+        if not eligible(b) or b.get('prefix') or not groups or not eligible(groups[-1][-1]):
+            groups.append([b]); continue
+        group = groups[-1]
+        a = group[-1]
+        size = a['style']['size']
+        left = min(x.get('body_left',x['bbox'][0]) for x in group)
+        next_left = b.get('body_left',b['bbox'][0])
+        # A displaced first line may be a first-line indent; after that the
+        # body anchor cannot wander. Never bridge independent columns.
+        aligned = abs(next_left-left)<=size*.15 or (
+            not group[0].get('prefix') and len(group)==1 and len(a['source_lines'])==1
+            and 0<left-next_left<=size*3)
+        if not same_style(a,b) or not aligned or abs(b.get('first_line_indent',0))>size*.15:
+            groups.append([b]); continue
+        peers = [p for p in candidates if same_style(a,p)
+                 and abs(p.get('body_left',p['bbox'][0])-min(left,next_left))<=size*.15]
+        right = max([a['bbox'][2],b['bbox'][2]]+[p['bbox'][2] for p in peers])
+        width = right-min(left,next_left)
+        # A long next word explains ragged right edges in a narrow column.
+        # Use its actual source glyph width, not sentence punctuation or a
+        # guessed font metric, to recognise that it could not fit above.
+        wrap_gap = max(size*2,width*.04,b.get('source_first_word_width',0)+size*.25)
+        full = (a['source_lines'][-1][2]>=right-wrap_gap
+                and a['source_lines'][-1][2]-a['source_lines'][-1][0]>=size*12)
+        pitches = [y-x for p in peers
+                   for values in [p.get('source_baselines') or [line[1] for line in p['source_lines']]]
+                   for x,y in zip(values,values[1:])]
+        pitches += [step(x,y) for x,y in zip(peers,peers[1:]) if 0<step(x,y)<=size*2.05]
+        pitches = sorted(p for p in pitches if size*.9<=p<=size*2.05)
+        pitch = float(np.median(pitches[:max(1,(len(pitches)+3)//4)])) if pitches else size*1.35
+        distance = step(a,b)
+        rect = fitz.Rect(a.get('fixed_bbox',a['bbox'])) | fitz.Rect(b.get('fixed_bbox',b['bbox']))
+        # A paragraph must not absorb a figure, cell, label or another column.
+        obstacles = any(p is not b and all(p is not m for m in group)
+                        and (fitz.Rect(p.get('fixed_bbox',p['bbox'])) & rect).get_area()>.1
+                        for p in ordered)
+        if full and size*.9<=distance<=min(size*2.05,pitch*1.15) and not obstacles:
+            group.append(b)
+        else:
+            groups.append([b])
+    return groups
+
+
+def join_native_paragraph(page, members):
+    """Re-read style/indent anchors once for the complete source paragraph."""
+    rect = fitz.Rect(members[0]['bbox'])
+    for b in members[1:]:
+        rect |= fitz.Rect(b['bbox'])
+    text = '\n'.join(b['text'].strip() for b in members)
+    text = re.sub(r'(?<=\w)-\s*\n\s*(?=[a-z])','',text)
+    block = {**members[0],'bbox':list(rect),'text':text,
+             'source_fragments':sum(b.get('source_fragments',1) for b in members)}
+    block.update(native_metadata(page,block))
+    return block
+
+
 def ocr_lines(image):
     global _OCR
     if _OCR is None:
@@ -268,9 +837,46 @@ def ocr_lines(image):
     for polygon, text, confidence in result or []:
         points = np.asarray(polygon)
         lines.append({"text": text, "confidence": float(confidence),
+                      "quad": points.astype(float).tolist(),
                       "bbox": [float(points[:, 0].min()), float(points[:, 1].min()),
                                float(points[:, 0].max()), float(points[:, 1].max())]})
     return reading_order(lines)
+
+
+def ocr_layout_line(line, bbox, sx, sy):
+    """Estimate size from the detector's rectified text height, not its AABB.
+
+    A tilted/curved word can have a nearly square outer box even though its
+    glyphs are small. Match RapidOCR's crop axes (including its tall-crop
+    rotation), then measure the height in the placed image's page coordinates.
+    This is source-only measurement, never a fit-to-translation font reduction.
+    Old schema-1 lines without quadrilaterals retain their previous behaviour.
+    """
+    height = (line['bbox'][3] - line['bbox'][1]) * sy
+    result = {**line, 'bbox': [bbox[0]+line['bbox'][0]*sx, bbox[1]+line['bbox'][1]*sy,
+                             bbox[0]+line['bbox'][2]*sx, bbox[1]+line['bbox'][3]*sy]}
+    size_source = 'ocr-axis-box'
+    if 'quad' in line:
+        points = np.asarray(line['quad'], dtype=float)
+        if points.shape == (4, 2) and np.isfinite(points).all():
+            def extent(p, a, b, c, d):
+                return max(float(np.linalg.norm(p[a]-p[b])), float(np.linalg.norm(p[c]-p[d])))
+            width, raw_height = extent(points, 0, 1, 2, 3), extent(points, 0, 3, 1, 2)
+            placed = points * (sx, sy)
+            if width > 0 and raw_height > 0:
+                # Choose the recognition axis before nonuniform image scaling.
+                # A lone narrow glyph (e.g. I) does not establish vertical text.
+                rotated = raw_height >= width*1.5 and len(line['text'].strip()) > 1
+                height = extent(placed, 0, 1, 2, 3) if rotated else extent(placed, 0, 3, 1, 2)
+                result['quad'] = (placed + (bbox[0], bbox[1])).tolist()
+                size_source = 'ocr-quad-height'
+            else:
+                result.pop('quad')
+        else:
+            result.pop('quad')
+    result['style'] = {'size': max(.1, min(48, height*.72)), 'bold': False,
+                       'family': 'serif', 'size_source': size_source}
+    return result
 
 
 def image_tables(image, warnings, lines=None):
@@ -307,8 +913,14 @@ def image_blocks(image, output, asset, bbox, warnings, native_lines=(), native_t
     path = output / asset
     path.parent.mkdir(exist_ok=True)
     image.convert("RGB").save(path, format="PNG")
-    lines = ocr_lines(image)
-    tables = image_tables(image, warnings, lines) or ruled_tables(image, lines)
+    key = (image.size, hashlib.sha256(image.convert('RGB').tobytes()).digest())
+    if key not in _IMAGE_CACHE:
+        lines = ocr_lines(image)
+        tables = image_tables(image, warnings, lines) or ruled_tables(image, lines)
+        if len(_IMAGE_CACHE) >= 32:
+            _IMAGE_CACHE.pop(next(iter(_IMAGE_CACHE)))
+        _IMAGE_CACHE[key] = (lines, tables)
+    lines, tables = copy.deepcopy(_IMAGE_CACHE[key])
     sx, sy = (bbox[2] - bbox[0]) / image.width, (bbox[3] - bbox[1]) / image.height
     def scaled_box(box):
         return [bbox[0] + box[0] * sx, bbox[1] + box[1] * sy,
@@ -330,7 +942,8 @@ def image_blocks(image, output, asset, bbox, warnings, native_lines=(), native_t
     text = "\n".join(line["text"] for line in selected)
     figure = {"type": "figure", "asset": asset, "text": text, "bbox": list(bbox),
               "extraction": "rapidocr", "ocr_lines": lines,
-              "layout_lines": [{**line, "bbox": scaled_box(line["bbox"])} for line in lines if not already_native(line)]}
+              "layout_lines": [ocr_layout_line(line, bbox, sx, sy)
+                               for line in lines if not already_native(line)]}
     scaled = [{**t, "bbox": scaled_box(t["bbox"]),
                "cells": [[scaled_box(cell) if cell else None for cell in row] for row in t.get("cells", [])]} for t in tables
               if not any(inside(scaled_box(t["bbox"]), region) for region in native_tables)]
@@ -383,6 +996,7 @@ def page_image(page):
 
 
 def pdf_page(page, output, warnings):
+    page = page if isinstance(page, PageAnalysis) else PageAnalysis(page)
     native = page.get_text("dict")
     text_blocks = [b for b in native["blocks"] if b["type"] == 0]
     visible = "".join(s["text"] for b in text_blocks for line in b["lines"] for s in line["spans"]).strip()
@@ -392,6 +1006,7 @@ def pdf_page(page, output, warnings):
     for table in page.find_tables().tables:
         rows = [[str(value or "") for value in row] for row in table.extract()]
         blocks.append({"type": "table", "bbox": list(table.bbox), "rows": rows, "extraction": "pymupdf",
+                       'table_header_rows':1 if table.header and not table.header.external and len(rows)>1 else 0,
                        "cells": [[list(cell) if cell else None for cell in row.cells] for row in table.rows]})
     native_tables = [b["bbox"] for b in blocks]
     native_lines = [{"bbox": line["bbox"], "text": "".join(s["text"] for s in line["spans"])}
@@ -421,16 +1036,41 @@ def pdf_page(page, output, warnings):
         blocks.append({"type": kind, "text": text, "bbox": list(block["bbox"]),
                        "level": 1 if size > body_size * 1.7 else 2, "extraction": "pymupdf"})
     blocks = coalesce_native_blocks(page, blocks)
+    blocks = native_definition_blocks(page, blocks)
     for block in blocks:
         if block["type"] not in {"figure", "formula"}:
-            inline = native_inline_math(page, block["bbox"], block["type"])
-            runs = [] if inline else native_layout_runs(page, block["bbox"], block["type"])
+            block.update(native_metadata(page, block))
+    blocks = [join_native_paragraph(page,group) if len(group)>1 else group[0]
+              for group in native_paragraph_groups(blocks)]
+    for block in blocks:
+        if block["type"] not in {"figure", "formula"}:
+            if block['type'] == 'table' and block.get('cells'):
+                spans = [s for b in page.get_text('dict', clip=fitz.Rect(block['bbox']))['blocks']
+                         if b['type'] == 0 for line in b['lines'] for s in line['spans']]
+                # Ordinary data cells can use their full cell rectangle. Keep
+                # the prose-run path for algorithms and mathematical artwork.
+                math = any(re.search(r'math|sym|AdvPS', s['font'], re.I)
+                           or re.search(r'[=\u222b\u2211\u221a\ue000-\uf8ff]', s['text']) for s in spans)
+                if not math:
+                    block['cell_styles'] = [[native_metadata(page, {'bbox': cell}).get('style', block.get('style', {'size': 9}))
+                                             if cell else None for cell in row] for row in block['cells']]
+                    contents = [[native_cell_content(page,cell,value) if cell and value.strip() else None
+                                 for cell,value in zip(cells,values)] for cells,values in zip(block['cells'],block['rows'])]
+                    if any(any(row) for row in contents):
+                        block['cell_content'] = contents
+                    continue
+            if block.get('toc_rows'):
+                continue
+            inline = protect_native_symbols(page, block, {} if block.get('prefix') else native_inline_math(page, block["bbox"], block["type"]))
+            runs = [] if inline or block.get('prefix') else native_layout_runs(page, block["bbox"], block["type"])
             if inline:
                 block.update(inline)
             elif runs:
                 block["layout_runs"] = runs
-            elif native_formula_only(page, block["bbox"]):
+            elif native_formula_only(page, block.get('fixed_bbox',block['bbox']) if block.get('prefix') else block['bbox']):
                 block["type"] = "formula"
+            if block['type'] not in ('formula','table','figure') and not block.get('layout_runs'):
+                block.update(native_text_styles(page, block))
     return reading_order(blocks), False
 
 
@@ -449,7 +1089,8 @@ def document_markdown(pages):
     return "\n\n".join(sections)
 
 
-def parse_document(path, output_dir, max_pages=500):
+def parse_document(path, output_dir, max_pages=500, on_progress=None):
+    _IMAGE_CACHE.clear()
     path = Path(path).resolve(strict=True)
     output = Path(output_dir).resolve()
     if not isinstance(max_pages, int) or not 1 <= max_pages <= 500:
@@ -474,12 +1115,16 @@ def parse_document(path, output_dir, max_pages=500):
                 raise ValueError("PDF_PASSWORD_REQUIRED")
             if not 1 <= len(document) <= max_pages:
                 raise ValueError("PAGE_LIMIT_EXCEEDED")
+            if on_progress:
+                on_progress(0, len(document))
             for page in document:
                 rotation = page.rotation
                 page.set_rotation(0)
                 blocks, used_ocr = pdf_page(page, output, warnings)
                 pages.append({"number": page.number + 1, "width": page.rect.width,
                               "height": page.rect.height, "rotation": rotation, "ocr": used_ocr, "blocks": blocks})
+                if on_progress:
+                    on_progress(len(pages), len(document))
     else:
         with Image.open(path) as image:
             if getattr(image, "n_frames", 1) > max_pages:
@@ -488,6 +1133,8 @@ def parse_document(path, output_dir, max_pages=500):
                 image.seek(n)
                 blocks = image_blocks(image, output, f"figures/image-{n + 1}.png", [0, 0, image.width, image.height], warnings)
                 pages.append({"number": n + 1, "width": image.width, "height": image.height, "ocr": True, "blocks": blocks})
+                if on_progress:
+                    on_progress(len(pages), getattr(image, 'n_frames', 1))
     assets = []
     for page in pages:
         for index, block in enumerate(page["blocks"]):
@@ -506,9 +1153,11 @@ def main():
     cli = argparse.ArgumentParser()
     cli.add_argument("--input", required=True)
     cli.add_argument("--output", required=True)
+    cli.add_argument('--progress', action='store_true')
     args = cli.parse_args()
     try:
-        result = parse_document(args.input, args.output)
+        callback = (lambda done,total: print('ZHANHTRAN_PROGRESS '+json.dumps({'stage':'parse','done':done,'total':total}), file=sys.stderr, flush=True)) if args.progress else None
+        result = parse_document(args.input, args.output, on_progress=callback)
         print(json.dumps({"ok": True, "pages": len(result["pages"]), "warnings": result["warnings"]}))
         return 0
     except Exception as error:
